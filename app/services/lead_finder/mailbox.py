@@ -45,7 +45,21 @@ def status(user_id: str) -> dict:
     if not r:
         return {"connected": False}
     return {"connected": True, "email": r["email"], "from_name": r.get("from_name") or "", "smtp_host": r["smtp_host"],
-            "smtp_port": r["smtp_port"], "imap_host": r.get("imap_host") or "", "imap_port": r.get("imap_port") or 993}
+            "smtp_port": r["smtp_port"], "imap_host": r.get("imap_host") or "", "imap_port": r.get("imap_port") or 993,
+            "test_mode": is_test(r)}
+
+
+def is_test(r: dict) -> bool:
+    """Only an explicit off sends to real people; a missing value (column not added yet) stays safe"""
+    return r.get("test_mode") is not False
+
+
+def set_test_mode(user_id: str, on: bool) -> None:
+    try:
+        get_supabase().table(TABLE).update({"test_mode": on}).eq("user_id", user_id).execute()
+    except Exception as e:
+        log.warning("test mode could not be saved: %s", type(e).__name__)
+        raise keys.KeysUnavailable("Test mode couldn't be saved: run backend/migrations/004_mailbox_test_mode.sql in Supabase.")
 
 
 def load(user_id: str) -> dict | None:
@@ -178,7 +192,7 @@ def _reason(e: smtplib.SMTPException) -> str:
     return f"The mail server didn't send it: {text[:160]}"
 
 
-def send(mb: dict, msgs: list[EmailMessage]) -> list[str | None]:
+def send(mb: dict, msgs: list[EmailMessage], copy_to_sent: bool = True) -> list[str | None]:
     """Sends each email over one connection. Returns, for each one, None when it went out or why it didn't.
     Raises MailboxError when the mailbox can't be reached at all, so nothing was sent."""
     try:
@@ -200,6 +214,6 @@ def send(mb: dict, msgs: list[EmailMessage]) -> list[str | None]:
             except smtplib.SMTPException as e:
                 errors.append(_reason(e))
     sent = [m for m, err in zip(msgs, errors) if err is None]
-    if sent and mb.get("imap_host"):
+    if sent and copy_to_sent and mb.get("imap_host"):
         _copy_to_sent(mb, sent)
     return errors

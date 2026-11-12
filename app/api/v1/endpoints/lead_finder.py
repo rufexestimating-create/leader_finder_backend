@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from app.api.deps import get_current_user
 import httpx
 
-from app.schemas.lead_finder import CompaniesIn, ContactPatch, KeyIn, MailboxIn, RetryIn, SearchIn, SettingsIn
+from app.schemas.lead_finder import CompaniesIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SearchIn, SettingsIn
 from app.services.lead_finder import discover, keys, mailbox, runner, store
 from app.services.lead_finder.providers import Hunter, ProviderError
 
@@ -69,11 +69,26 @@ def send_company(company_id: str, user: dict = Depends(get_current_user)):
     if company["status"] not in ("ready", "approved"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Only a company that is ready to review can be emailed.")
     mb = _mailbox(user)
+    test = mailbox.is_test(mb)
     todo = [p for p in company["contacts"]
-            if p.get("selected") and p.get("email") and not p.get("sent_at") and p.get("email_status") != "invalid"]
+            if p.get("selected") and p.get("email") and (test or not p.get("sent_at")) and p.get("email_status") != "invalid"]
     if not todo:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick at least one person who hasn't been emailed yet.")
     s = store.get_settings(user["id"])
+    if test:
+        # Everything goes to the user's own inbox; the real people are untouched and can still be emailed later
+        msgs = []
+        for p in todo:
+            subject, body = mailbox.render(s, company, p)
+            note = f"TEST MODE: with test mode off, this email goes to {p['name']} <{p['email']}>.\n\n"
+            msgs.append(mailbox.build(mb, mb["email"], mb.get("from_name") or "", f"[Test] {subject}", note + body))
+        try:
+            errors = mailbox.send(mb, msgs, copy_to_sent=False)
+        except mailbox.MailboxError as e:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+        if errors[0] is not None and all(errors):
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, errors[0])
+        return {**company, "test_sent": sum(err is None for err in errors)}
     msgs = [mailbox.build(mb, p["email"], p["name"], *mailbox.render(s, company, p)) for p in todo]
     try:
         errors = mailbox.send(mb, msgs)
@@ -219,6 +234,16 @@ def test_mailbox(user: dict = Depends(get_current_user)):
     if error:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, error)
     return {"message": f"Test email sent to {mb['email']}. Check its inbox, and its Sent folder for the copy."}
+
+
+@router.patch("/mailbox", summary="Turn test mode on (every email goes to the mailbox itself) or off")
+def set_mailbox_mode(data: MailboxModeIn, user: dict = Depends(get_current_user)):
+    _mailbox(user)
+    try:
+        mailbox.set_test_mode(user["id"], data.test_mode)
+        return mailbox.status(user["id"])
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
 
 
 @router.delete("/mailbox", status_code=status.HTTP_204_NO_CONTENT, summary="Disconnect the mailbox")

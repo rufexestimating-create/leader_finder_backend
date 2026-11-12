@@ -118,6 +118,10 @@ class MailboxIn(BaseModel):
         return v.strip()
 
 
+class MailboxModeIn(BaseModel):
+    test_mode: bool
+
+
 class RetryIn(BaseModel):
     website: str = Field("", max_length=255)
 
