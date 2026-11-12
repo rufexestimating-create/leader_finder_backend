@@ -1,0 +1,15 @@
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.1
+email-validator==2.3.0
+dnspython==2.9.0
+python-dotenv==1.2.4
+httpx==0.28.1
+resend==2.50.0
+supabase==2.33.0
+bcrypt==5.0.0
+cryptography==50.0.2
+PyJWT==2.15.1
+tzdata==2026.5
+pytest>=8.3.0
