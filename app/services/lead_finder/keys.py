@@ -175,11 +175,19 @@ def _ai(c: httpx.Client, key: str) -> Check:
 
 
 def _apollo(c: httpx.Client, key: str) -> Check:
-    r = c.get("https://api.apollo.io/v1/auth/health", headers={"x-api-key": key})
+    r = c.get("https://api.apollo.io/v1/users/self", headers={"x-api-key": key, "Content-Type": "application/json"})
     if r.status_code in (401, 403):
         return Check(False, "Apollo didn't accept this key. Copy it again from app.apollo.io/#/settings/integrations/api.")
     if r.status_code != 200:
         return Check(False, f"Apollo answered with an error ({r.status_code}). Try again in a moment.")
+    d = (r.json() or {}).get("user") or {}
+    org = (r.json() or {}).get("organization") or {}
+    exports = _num((org.get("non_stopgap_num_credits_used_this_month") or 0))
+    limit = _num((org.get("num_credits_limit") or org.get("monthly_credits") or 0))
+    left = max(0.0, limit - exports)
+    plan = d.get("title") or org.get("plan_tier") or "your"
+    if limit:
+        return Check(True, f"Connected. {plan} plan, {int(left):,} email credits left this month.")
     return Check(True, "Connected. Apollo is ready.")
 
 
@@ -202,12 +210,28 @@ def _openai(c: httpx.Client, key: str) -> Check:
         headers={"Authorization": f"Bearer {key}"},
         json={"model": DEFAULT_OPENAI_MODEL, "messages": [{"role": "user", "content": "Reply with the single word OK."}], "max_tokens": 8},
     )
-    if r.status_code in (400, 401, 403):
+    if r.status_code in (401, 403):
         return Check(False, "OpenAI didn't accept this key. Copy it again from platform.openai.com/api-keys.")
     if r.status_code == 429:
-        return Check(False, "This OpenAI key is out of quota. Check your billing at platform.openai.com.")
+        err_code = ((r.json() or {}).get("error") or {}).get("code") or ""
+        if err_code == "insufficient_quota":
+            return Check(False, "No billing credits on this OpenAI account. Add at least $5 at platform.openai.com/settings/billing/overview.")
+        return Check(False, "OpenAI rate limit hit. Wait a moment and try again.")
+    if r.status_code == 400:
+        err_code = ((r.json() or {}).get("error") or {}).get("code") or ""
+        if err_code == "insufficient_quota":
+            return Check(False, "No billing credits on this OpenAI account. Add at least $5 at platform.openai.com/settings/billing/overview.")
+        return Check(False, "OpenAI didn't accept this key. Copy it again from platform.openai.com/api-keys.")
     if r.status_code != 200:
         return Check(False, f"OpenAI answered with an error ({r.status_code}). Try again in a moment.")
+    # Show remaining balance from the billing API
+    bal_r = c.get(f"{DEFAULT_OPENAI_BASE_URL}/dashboard/billing/credit_grants", headers={"Authorization": f"Bearer {key}"})
+    if bal_r.status_code == 200:
+        grants = bal_r.json() or {}
+        remaining = _num(grants.get("total_available"))
+        total = _num(grants.get("total_granted"))
+        if total:
+            return Check(True, f"Connected. ${remaining:.2f} of ${total:.2f} credits remaining.")
     return Check(True, "Connected. OpenAI answered.")
 
 
@@ -219,6 +243,11 @@ def _pdl(c: httpx.Client, key: str) -> Check:
     if r.status_code == 402:
         return Check(False, "People Data Labs credits are used up. Check your plan at peopledatalabs.com.")
     if r.status_code in (200, 404):
+        body = r.json() or {}
+        rate = body.get("rateLimit") or {}
+        available = rate.get("creditsAvailable")
+        if available is not None:
+            return Check(True, f"Connected. {int(_num(available)):,} credits remaining.")
         return Check(True, "Connected. People Data Labs is ready.")
     return Check(False, f"People Data Labs answered with an error ({r.status_code}). Try again in a moment.")
 
