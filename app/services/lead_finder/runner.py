@@ -13,7 +13,7 @@ import httpx
 from app.core.config import settings as app_settings
 from app.db.supabase import is_supabase_configured
 from app.services.lead_finder import engine, keys, store, website
-from app.services.lead_finder.providers import Hunter, ReoonVerifier, Serper
+from app.services.lead_finder.providers import Apollo, GooglePlacesAPI, Hunter, PDL, ReoonVerifier, Serper
 from app.services.lead_finder.writer import Writer
 
 INTERVAL_SECONDS = 10
@@ -31,7 +31,11 @@ def tools_status(user_settings: dict, user_keys: dict) -> dict:
     the website search and the Google rating."""
     on = user_settings.get("tools") or {}
     has = lambda provider: bool((user_keys.get(provider) or {}).get("key"))  # noqa: E731
-    connected = {"hunter": has("hunter"), "serper": has("serper"), "verifier": has("reoon"), "places": has("serper"), "ai": has("ai")}
+    connected = {
+        "hunter": has("hunter"), "serper": has("serper"), "verifier": has("reoon"),
+        "places": has("serper"), "ai": has("ai"),
+        "apollo": has("apollo"), "gplaces": has("gplaces"), "openai": has("openai"), "pdl": has("pdl"),
+    }
     return {tool: {"connected": ok, "on": bool(on.get(tool, True))} for tool, ok in connected.items()}
 
 
@@ -47,6 +51,10 @@ def build_tools(user_settings: dict, user_keys: dict, client: httpx.Client) -> e
         verifier=ReoonVerifier(key("reoon"), client) if use("verifier") else None,
         writer=Writer(key("ai"), keys.DEFAULT_AI_MODEL, keys.DEFAULT_AI_BASE_URL, client) if use("ai") else None,
         read_site=lambda domain, name, city: website.read_site(client, domain, name, city),
+        apollo=Apollo(key("apollo"), client) if use("apollo") else None,
+        gplaces=GooglePlacesAPI(key("gplaces"), client) if use("gplaces") else None,
+        openai_writer=Writer(key("openai"), keys.DEFAULT_OPENAI_MODEL, keys.DEFAULT_OPENAI_BASE_URL, client) if use("openai") else None,
+        pdl=PDL(key("pdl"), client) if use("pdl") else None,
     )
 
 

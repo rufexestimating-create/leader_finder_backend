@@ -23,7 +23,7 @@ from app.services.lead_finder import writer as writer_mod
 from app.services.lead_finder import website
 from app.services.lead_finder.constants import ALWAYS_SKIP, STEP_IDS, country_code, roles_for, type_label
 from app.services.lead_finder.personalize import pick_line
-from app.services.lead_finder.providers import Hunter, ProviderError, ReoonVerifier, Serper
+from app.services.lead_finder.providers import Apollo, GooglePlacesAPI, Hunter, PDL, ProviderError, ReoonVerifier, Serper
 
 NO_WEBSITE = "We couldn't find a website for this company. Add its website and try again."
 
@@ -32,11 +32,15 @@ NO_WEBSITE = "We couldn't find a website for this company. Add its website and t
 class Tools:
     """What this run may use; None = not connected or switched off in Settings"""
     hunter: Hunter | None = None
-    serper: Serper | None = None    # Google search, for the website
-    places: Serper | None = None    # Google Maps, for the rating, reviews, phone and address
+    serper: Serper | None = None          # Google search, for the website
+    places: Serper | None = None          # Google Maps (via Serper), for rating/phone/address
     verifier: ReoonVerifier | None = None
-    writer: writer_mod.Writer | None = None  # the AI that writes the personal line; None = templates only
+    writer: writer_mod.Writer | None = None        # Gemini: writes the personal line
     read_site: Callable[[str, str, str], website.SiteData] | None = None
+    apollo: Apollo | None = None          # Fallback email finder when Hunter has no match
+    gplaces: GooglePlacesAPI | None = None # Direct Google Places API fallback for rating/phone/address
+    openai_writer: writer_mod.Writer | None = None # OpenAI fallback when Gemini is unavailable
+    pdl: PDL | None = None                # Enriches contacts with professional background
 
 
 @dataclass
@@ -236,6 +240,20 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
                     sources.append({"label": "Google Maps", "url": f"https://www.google.com/maps/search/?api=1&query={quote_plus(f'{name} {city}')}"})
         except ProviderError as e:
             rating_note = f". No Google rating: {e}"
+    elif tools.gplaces:
+        try:
+            listings = tools.gplaces.search(" ".join(dict.fromkeys(x for x in (name, city, state) if x)))
+            p = _best_place(listings, name, domain, found["phone"])
+            if p:
+                found["address"] = p.get("address")
+                found["phone"] = found["phone"] or p.get("phone")
+                if p.get("rating"):
+                    found["rating"] = round(float(p["rating"]), 1)
+                    found["reviews"] = int(p.get("reviews") or 0) or None
+                    rating_note = f", Google rating {found['rating']}"
+                    sources.append({"label": "Google Maps", "url": f"https://www.google.com/maps/search/?api=1&query={quote_plus(f'{name} {city}')}"})
+        except ProviderError as e:
+            rating_note = f". No Google rating: {e}"
     news, news_note = [], ""
     if tools.serper:
         try:
@@ -261,6 +279,15 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
         except ProviderError as e:
             people_problem = str(e)
     chosen = people_mod.rank(hunter_people, site.people, roles)
+    if chosen and tools.pdl:
+        for p in chosen:
+            try:
+                pdl_data = tools.pdl.enrich(p["name"], name)
+                if pdl_data:
+                    p["title"] = p.get("title") or pdl_data.get("title")
+                    p["linkedin"] = p.get("linkedin") or pdl_data.get("linkedin")
+            except Exception:
+                pass
     if not chosen:
         note = "No one matching your roles was found"
         if site.emails:
@@ -291,6 +318,13 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
             except ProviderError as e:
                 email_problem = str(e)
                 hunter_on = not e.fatal
+        if not p.get("email") and tools.apollo:
+            first, last = people_mod.split_name(p["name"])
+            hit = tools.apollo.find_email(first, last, domain)
+            if hit:
+                p.update(email=hit["email"], email_source="Apollo",
+                         linkedin=p.get("linkedin") or hit.get("linkedin"),
+                         title=p.get("title") or hit.get("title") or p.get("title"))
         if not p.get("email"):
             guess = people_mod.guess_email(pattern, p["name"], domain)
             if guess:
@@ -325,19 +359,25 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
     steps.done("verify", note + (f". {verify_problem}" if verify_problem else ""))
 
     # ---------- 8. Personal line ----------
-    line, how, ai_problem = "", "", ""
+    line, how, ai_problem = “”, “”, “”
     if tools.writer:
-        written = tools.writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get("message") or "")
+        written = tools.writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get(“message”) or “”)
         if written.line:
-            line, how = written.line, f"Written by the AI from: “{written.evidence}”"
+            line, how = written.line, f”Written by the AI from: “{written.evidence}””
         else:
-            ai_problem = f"The AI wrote nothing: {written.reason}. "
+            ai_problem = f”The AI wrote nothing: {written.reason}. “
+    if not line and tools.openai_writer:
+        written = tools.openai_writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get(“message”) or “”)
+        if written.line:
+            line, how = written.line, f”Written by OpenAI from: “{written.evidence}””
+        elif not ai_problem:
+            ai_problem = f”OpenAI wrote nothing: {written.reason}. “
     if not line:
-        picked = pick_line({**company, **found}, settings.get("templates") or [])
+        picked = pick_line({**company, **found}, settings.get(“templates”) or [])
         if picked:
-            line, how = picked[0], f"{ai_problem}Used template {picked[1]}"
+            line, how = picked[0], f”{ai_problem}Used template {picked[1]}”
         else:
-            how = f"{ai_problem}No template fit, so the message starts without a personal line"
+            how = f”{ai_problem}No template fit, so the message starts without a personal line”
     steps.done("line", how)
 
     contacts = [{

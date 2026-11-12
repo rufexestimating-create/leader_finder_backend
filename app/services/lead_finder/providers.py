@@ -203,6 +203,86 @@ class Serper:
         ]
 
 
+class Apollo:
+    BASE = "https://api.apollo.io/v1"
+
+    def __init__(self, api_key: str, client: httpx.Client):
+        self.client = client
+        self.headers = {"x-api-key": api_key, "Content-Type": "application/json"}
+
+    def find_email(self, first_name: str, last_name: str, domain: str) -> dict | None:
+        """Email + LinkedIn for one person at this domain, or None when Apollo has no match."""
+        body = {"first_name": first_name, "last_name": last_name, "organization_domain": domain}
+        try:
+            res = _call("Apollo", lambda: self.client.post(f"{self.BASE}/people/match", json=body, headers=self.headers, timeout=TIMEOUT))
+        except ProviderError:
+            return None
+        data = (res.json() or {}).get("person") or {}
+        email = (data.get("email") or "").lower()
+        if not email or "@" not in email:
+            return None
+        return {"email": email, "linkedin": data.get("linkedin_url"), "title": data.get("title") or ""}
+
+
+class GooglePlacesAPI:
+    SEARCH_URL = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    DETAILS_URL = "https://maps.googleapis.com/maps/api/place/details/json"
+
+    def __init__(self, api_key: str, client: httpx.Client):
+        self.client = client
+        self.api_key = api_key
+
+    def search(self, query: str) -> list[dict]:
+        """Places matching the query: [{title, address, rating, reviews, phone, website}]"""
+        try:
+            res = _call("Google Places", lambda: self.client.get(
+                self.SEARCH_URL, params={"query": query, "key": self.api_key}, timeout=TIMEOUT))
+        except ProviderError:
+            return []
+        results = []
+        for p in (res.json() or {}).get("results") or []:
+            phone = None
+            place_id = p.get("place_id")
+            if place_id:
+                try:
+                    dr = self.client.get(self.DETAILS_URL, params={
+                        "place_id": place_id, "key": self.api_key,
+                        "fields": "formatted_phone_number,website"}, timeout=TIMEOUT)
+                    details = (dr.json() or {}).get("result") or {}
+                    phone = details.get("formatted_phone_number")
+                except Exception:
+                    pass
+            results.append({
+                "title": p.get("name") or "",
+                "address": p.get("formatted_address"),
+                "rating": p.get("rating"),
+                "reviews": p.get("user_ratings_total"),
+                "phone": phone,
+                "website": p.get("website"),
+            })
+        return results
+
+
+class PDL:
+    URL = "https://api.peopledatalabs.com/v5/person/enrich"
+
+    def __init__(self, api_key: str, client: httpx.Client):
+        self.client = client
+        self.headers = {"X-Api-Key": api_key}
+
+    def enrich(self, name: str, company: str) -> dict | None:
+        """Professional data for a person: {title, linkedin_url} or None when PDL has no match."""
+        params = {"name": name, "company": company, "pretty": "false"}
+        try:
+            res = _call("People Data Labs", lambda: self.client.get(self.URL, params=params, headers=self.headers, timeout=TIMEOUT))
+        except ProviderError:
+            return None
+        d = ((res.json() or {}).get("data") or {}) if res.status_code == 200 else {}
+        if not d:
+            return None
+        return {"title": d.get("job_title") or "", "linkedin": d.get("linkedin_url")}
+
+
 class ReoonVerifier:
     URL = "https://emailverifier.reoon.com/api/v1/verify"
     # Power mode asks the mailbox itself, so it can tell catch-all domains apart; it can take a minute

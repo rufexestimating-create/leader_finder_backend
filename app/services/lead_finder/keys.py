@@ -15,10 +15,13 @@ from app.core.config import settings
 from app.db.supabase import get_supabase
 
 TABLE = "prospect_api_keys"
-PROVIDERS = ("hunter", "serper", "reoon", "ai")
+PROVIDERS = ("hunter", "serper", "reoon", "ai", "apollo", "gplaces", "openai", "pdl")
 DEFAULT_AI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_AI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-NAMES = {"hunter": "Hunter", "serper": "Serper", "reoon": "Reoon", "ai": "The AI"}
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+NAMES = {"hunter": "Hunter", "serper": "Serper", "reoon": "Reoon", "ai": "The AI",
+         "apollo": "Apollo.io", "gplaces": "Google Places", "openai": "OpenAI", "pdl": "People Data Labs"}
 
 log = logging.getLogger("uvicorn.error")
 
@@ -171,7 +174,57 @@ def _ai(c: httpx.Client, key: str) -> Check:
     return Check(True, "Connected. The AI answered.")
 
 
-_CHECKS = {"hunter": _hunter, "serper": _serper, "reoon": _reoon, "ai": _ai}
+def _apollo(c: httpx.Client, key: str) -> Check:
+    r = c.get("https://api.apollo.io/v1/auth/health", headers={"x-api-key": key})
+    if r.status_code in (401, 403):
+        return Check(False, "Apollo didn't accept this key. Copy it again from app.apollo.io/#/settings/integrations/api.")
+    if r.status_code != 200:
+        return Check(False, f"Apollo answered with an error ({r.status_code}). Try again in a moment.")
+    return Check(True, "Connected. Apollo is ready.")
+
+
+def _gplaces(c: httpx.Client, key: str) -> Check:
+    r = c.get("https://maps.googleapis.com/maps/api/place/textsearch/json", params={"query": "test", "key": key})
+    if r.status_code == 200:
+        status = (r.json() or {}).get("status")
+        if status == "REQUEST_DENIED":
+            msg = (r.json() or {}).get("error_message") or "Key not authorised for Places API."
+            return Check(False, f"Google Places denied the request: {msg}")
+        return Check(True, "Connected. Google Places API is ready.")
+    if r.status_code in (400, 403):
+        return Check(False, "Google didn't accept this key. Make sure the Places API is enabled in your Google Cloud project.")
+    return Check(False, f"Google Places answered with an error ({r.status_code}). Try again in a moment.")
+
+
+def _openai(c: httpx.Client, key: str) -> Check:
+    r = c.post(
+        f"{DEFAULT_OPENAI_BASE_URL}/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": DEFAULT_OPENAI_MODEL, "messages": [{"role": "user", "content": "Reply with the single word OK."}], "max_tokens": 8},
+    )
+    if r.status_code in (400, 401, 403):
+        return Check(False, "OpenAI didn't accept this key. Copy it again from platform.openai.com/api-keys.")
+    if r.status_code == 429:
+        return Check(False, "This OpenAI key is out of quota. Check your billing at platform.openai.com.")
+    if r.status_code != 200:
+        return Check(False, f"OpenAI answered with an error ({r.status_code}). Try again in a moment.")
+    return Check(True, "Connected. OpenAI answered.")
+
+
+def _pdl(c: httpx.Client, key: str) -> Check:
+    r = c.get("https://api.peopledatalabs.com/v5/person/enrich", headers={"X-Api-Key": key},
+              params={"name": "John Smith", "company": "Google", "pretty": "false"})
+    if r.status_code in (401, 403):
+        return Check(False, "People Data Labs didn't accept this key. Copy it again from your PDL dashboard.")
+    if r.status_code == 402:
+        return Check(False, "People Data Labs credits are used up. Check your plan at peopledatalabs.com.")
+    if r.status_code in (200, 404):
+        return Check(True, "Connected. People Data Labs is ready.")
+    return Check(False, f"People Data Labs answered with an error ({r.status_code}). Try again in a moment.")
+
+
+_CHECKS = {"hunter": _hunter, "serper": _serper, "reoon": _reoon, "ai": _ai,
+           "apollo": _apollo, "gplaces": _gplaces, "openai": _openai, "pdl": _pdl}
 
 
 def check_key(provider: str, key: str, client: httpx.Client | None = None) -> Check:
