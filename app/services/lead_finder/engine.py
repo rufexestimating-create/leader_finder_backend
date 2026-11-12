@@ -359,25 +359,25 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
     steps.done("verify", note + (f". {verify_problem}" if verify_problem else ""))
 
     # ---------- 8. Personal line ----------
-    line, how, ai_problem = “”, “”, “”
+    line, how, ai_problem = '', '', ''
     if tools.writer:
-        written = tools.writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get(“message”) or “”)
+        written = tools.writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get('message') or '')
         if written.line:
-            line, how = written.line, f”Written by the AI from: “{written.evidence}””
+            line, how = written.line, 'Written by the AI from: “' + written.evidence + '”'
         else:
-            ai_problem = f”The AI wrote nothing: {written.reason}. “
+            ai_problem = 'The AI wrote nothing: ' + written.reason + '. '
     if not line and tools.openai_writer:
-        written = tools.openai_writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get(“message”) or “”)
+        written = tools.openai_writer.write(writer_mod.build_facts(company, found, site.excerpts, news), settings.get('message') or '')
         if written.line:
-            line, how = written.line, f”Written by OpenAI from: “{written.evidence}””
+            line, how = written.line, 'Written by OpenAI from: “' + written.evidence + '”'
         elif not ai_problem:
-            ai_problem = f”OpenAI wrote nothing: {written.reason}. “
+            ai_problem = 'OpenAI wrote nothing: ' + written.reason + '. '
     if not line:
-        picked = pick_line({**company, **found}, settings.get(“templates”) or [])
+        picked = pick_line({**company, **found}, settings.get('templates') or [])
         if picked:
-            line, how = picked[0], f”{ai_problem}Used template {picked[1]}”
+            line, how = picked[0], ai_problem + 'Used template ' + str(picked[1])
         else:
-            how = f”{ai_problem}No template fit, so the message starts without a personal line”
+            how = ai_problem + 'No template fit, so the message starts without a personal line'
     steps.done("line", how)
 
     contacts = [{
