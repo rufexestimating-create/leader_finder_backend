@@ -181,20 +181,15 @@ def _apollo(c: httpx.Client, key: str) -> Check:
         return Check(False, "Apollo didn't accept this key. Copy it again from app.apollo.io/#/settings/integrations/api.")
     if r.status_code != 200:
         return Check(False, f"Apollo answered with an error ({r.status_code}). Try again in a moment.")
-    # Try to get credit info from organization endpoint
-    try:
-        cr = c.post("https://api.apollo.io/v1/users/search", json={"api_key": key}, headers=hdrs, timeout=httpx.Timeout(10.0))
-        if cr.status_code == 200:
-            user = ((cr.json() or {}).get("users") or [{}])[0] or {}
-            org = user.get("organization_billing_json") or {}
-            limit = _num(org.get("credits_limit_per_month") or org.get("monthly_credits") or 0)
-            used = _num(org.get("credits_used_this_month") or 0)
-            if limit:
-                left = max(0.0, limit - used)
-                return Check(True, f"Connected. {int(left):,} of {int(limit):,} email credits left this month.")
-    except Exception:
-        pass
-    return Check(True, "Connected. Apollo is ready.")
+    # A made-up person never matches, so this costs no credit; it only shows whether the plan allows the email finder
+    m = c.post("https://api.apollo.io/api/v1/people/match", headers=hdrs,
+               json={"first_name": "Zzqx", "last_name": "Nobodyish", "domain": "example.com"})
+    if m.status_code == 403:
+        return Check(False, "This key works, but Apollo's Free plan doesn't allow finding emails through the API. "
+                            "Upgrade to any paid Apollo plan to use it here.")
+    if m.status_code == 429:
+        return Check(False, "Apollo's credits or rate limit are used up for now. Try again later.")
+    return Check(True, "Connected. Apollo doesn't share its credit balance through the API: see app.apollo.io > Settings > Credits.")
 
 
 def _gplaces(c: httpx.Client, key: str) -> Check:
@@ -242,37 +237,19 @@ def _openai(c: httpx.Client, key: str) -> Check:
 
 
 def _pdl(c: httpx.Client, key: str) -> Check:
-    hdrs = {"X-Api-Key": key}
-    # Use the account endpoint to get credit balance directly
-    acc = c.get("https://api.peopledatalabs.com/v5/account", headers=hdrs)
-    if acc.status_code in (401, 403):
-        return Check(False, "People Data Labs didn't accept this key. Copy it again from your PDL dashboard.")
-    if acc.status_code == 402:
-        return Check(False, "People Data Labs credits are used up. Check your plan at peopledatalabs.com.")
-    if acc.status_code == 200:
-        body = acc.json() or {}
-        credits = body.get("credits") or {}
-        remaining = credits.get("remaining") if isinstance(credits, dict) else None
-        total = credits.get("total") if isinstance(credits, dict) else None
-        if remaining is not None and total is not None:
-            return Check(True, f"Connected. {int(_num(remaining)):,} of {int(_num(total)):,} credits remaining.")
-        if remaining is not None:
-            return Check(True, f"Connected. {int(_num(remaining)):,} credits remaining.")
-    # Fallback: validate key with an enrich call
-    r = c.get("https://api.peopledatalabs.com/v5/person/enrich", headers=hdrs,
-              params={"name": "John Smith", "company": "Google", "pretty": "false"})
+    # A made-up person is never found, and PDL only charges for a match; the balance comes back in the headers
+    r = c.get("https://api.peopledatalabs.com/v5/person/enrich", headers={"X-Api-Key": key},
+              params={"name": "Zzqx Nobodyish", "company": "nonexistentco12345"})
     if r.status_code in (401, 403):
         return Check(False, "People Data Labs didn't accept this key. Copy it again from your PDL dashboard.")
     if r.status_code == 402:
         return Check(False, "People Data Labs credits are used up. Check your plan at peopledatalabs.com.")
-    if r.status_code in (200, 404):
-        body = r.json() or {}
-        rate = body.get("rateLimit") or {}
-        available = rate.get("creditsAvailable")
-        if available is not None:
-            return Check(True, f"Connected. {int(_num(available)):,} credits remaining.")
-        return Check(True, "Connected. People Data Labs is ready.")
-    return Check(False, f"People Data Labs answered with an error ({r.status_code}). Try again in a moment.")
+    if r.status_code not in (200, 404):
+        return Check(False, f"People Data Labs answered with an error ({r.status_code}). Try again in a moment.")
+    left = r.headers.get("x-totallimit-remaining")
+    if left is not None:
+        return Check(True, f"Connected. {int(_num(left)):,} credits left.")
+    return Check(True, "Connected. People Data Labs is ready.")
 
 
 _CHECKS = {"hunter": _hunter, "serper": _serper, "reoon": _reoon, "ai": _ai,

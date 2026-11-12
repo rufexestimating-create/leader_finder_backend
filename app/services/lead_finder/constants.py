@@ -90,7 +90,8 @@ DEFAULT_SETTINGS = {
     ),
     "daily_limit": 50,
     "at_once": 2,
-    "tools": {"hunter": True, "serper": True, "verifier": True, "places": True, "ai": True},
+    "tools": {"hunter": True, "serper": True, "verifier": True, "places": True, "ai": True,
+              "apollo": True, "gplaces": True, "openai": True, "pdl": True},
 }
 
 

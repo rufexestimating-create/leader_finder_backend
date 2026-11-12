@@ -204,7 +204,7 @@ class Serper:
 
 
 class Apollo:
-    BASE = "https://api.apollo.io/v1"
+    BASE = "https://api.apollo.io/api/v1"
 
     def __init__(self, api_key: str, client: httpx.Client):
         self.client = client
@@ -212,7 +212,7 @@ class Apollo:
 
     def find_email(self, first_name: str, last_name: str, domain: str) -> dict | None:
         """Email + LinkedIn for one person at this domain, or None when Apollo has no match."""
-        body = {"first_name": first_name, "last_name": last_name, "organization_domain": domain}
+        body = {"first_name": first_name, "last_name": last_name, "domain": domain}
         try:
             res = _call("Apollo", lambda: self.client.post(f"{self.BASE}/people/match", json=body, headers=self.headers, timeout=TIMEOUT))
         except ProviderError:

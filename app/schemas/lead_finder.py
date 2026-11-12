@@ -143,7 +143,7 @@ class SettingsIn(BaseModel):
     @field_validator("tools")
     @classmethod
     def known_tools(cls, v: dict[str, bool]) -> dict[str, bool]:
-        unknown = [k for k in v if k not in ("hunter", "serper", "verifier", "places", "ai")]
+        unknown = [k for k in v if k not in ("hunter", "serper", "verifier", "places", "ai", "apollo", "gplaces", "openai", "pdl")]
         if unknown:
             raise ValueError(f"unknown tools: {', '.join(unknown)}")
         return v
