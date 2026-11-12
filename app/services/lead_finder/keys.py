@@ -175,19 +175,25 @@ def _ai(c: httpx.Client, key: str) -> Check:
 
 
 def _apollo(c: httpx.Client, key: str) -> Check:
-    r = c.get("https://api.apollo.io/v1/users/self", headers={"x-api-key": key, "Content-Type": "application/json"})
+    hdrs = {"x-api-key": key, "Content-Type": "application/json"}
+    r = c.get("https://api.apollo.io/v1/auth/health", headers=hdrs)
     if r.status_code in (401, 403):
         return Check(False, "Apollo didn't accept this key. Copy it again from app.apollo.io/#/settings/integrations/api.")
     if r.status_code != 200:
         return Check(False, f"Apollo answered with an error ({r.status_code}). Try again in a moment.")
-    d = (r.json() or {}).get("user") or {}
-    org = (r.json() or {}).get("organization") or {}
-    exports = _num((org.get("non_stopgap_num_credits_used_this_month") or 0))
-    limit = _num((org.get("num_credits_limit") or org.get("monthly_credits") or 0))
-    left = max(0.0, limit - exports)
-    plan = d.get("title") or org.get("plan_tier") or "your"
-    if limit:
-        return Check(True, f"Connected. {plan} plan, {int(left):,} email credits left this month.")
+    # Try to get credit info from organization endpoint
+    try:
+        cr = c.post("https://api.apollo.io/v1/users/search", json={"api_key": key}, headers=hdrs, timeout=httpx.Timeout(10.0))
+        if cr.status_code == 200:
+            user = ((cr.json() or {}).get("users") or [{}])[0] or {}
+            org = user.get("organization_billing_json") or {}
+            limit = _num(org.get("credits_limit_per_month") or org.get("monthly_credits") or 0)
+            used = _num(org.get("credits_used_this_month") or 0)
+            if limit:
+                left = max(0.0, limit - used)
+                return Check(True, f"Connected. {int(left):,} of {int(limit):,} email credits left this month.")
+    except Exception:
+        pass
     return Check(True, "Connected. Apollo is ready.")
 
 
@@ -236,7 +242,24 @@ def _openai(c: httpx.Client, key: str) -> Check:
 
 
 def _pdl(c: httpx.Client, key: str) -> Check:
-    r = c.get("https://api.peopledatalabs.com/v5/person/enrich", headers={"X-Api-Key": key},
+    hdrs = {"X-Api-Key": key}
+    # Use the account endpoint to get credit balance directly
+    acc = c.get("https://api.peopledatalabs.com/v5/account", headers=hdrs)
+    if acc.status_code in (401, 403):
+        return Check(False, "People Data Labs didn't accept this key. Copy it again from your PDL dashboard.")
+    if acc.status_code == 402:
+        return Check(False, "People Data Labs credits are used up. Check your plan at peopledatalabs.com.")
+    if acc.status_code == 200:
+        body = acc.json() or {}
+        credits = body.get("credits") or {}
+        remaining = credits.get("remaining") if isinstance(credits, dict) else None
+        total = credits.get("total") if isinstance(credits, dict) else None
+        if remaining is not None and total is not None:
+            return Check(True, f"Connected. {int(_num(remaining)):,} of {int(_num(total)):,} credits remaining.")
+        if remaining is not None:
+            return Check(True, f"Connected. {int(_num(remaining)):,} credits remaining.")
+    # Fallback: validate key with an enrich call
+    r = c.get("https://api.peopledatalabs.com/v5/person/enrich", headers=hdrs,
               params={"name": "John Smith", "company": "Google", "pretty": "false"})
     if r.status_code in (401, 403):
         return Check(False, "People Data Labs didn't accept this key. Copy it again from your PDL dashboard.")
