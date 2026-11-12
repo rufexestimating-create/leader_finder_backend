@@ -103,6 +103,21 @@ class KeyIn(BaseModel):
         return v
 
 
+class MailboxIn(BaseModel):
+    email: str = Field(min_length=3, max_length=254, pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    password: str = Field(min_length=1, max_length=300)
+    from_name: str = Field(default="", max_length=100)
+    smtp_host: str = Field(default="smtp.hostinger.com", min_length=3, max_length=255)
+    smtp_port: int = Field(default=465, ge=1, le=65535)
+    imap_host: str = Field(default="imap.hostinger.com", max_length=255)
+    imap_port: int = Field(default=993, ge=1, le=65535)
+
+    @field_validator("email", "smtp_host", "imap_host", "from_name")
+    @classmethod
+    def trimmed(cls, v: str) -> str:
+        return v.strip()
+
+
 class RetryIn(BaseModel):
     website: str = Field("", max_length=255)
 

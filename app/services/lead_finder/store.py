@@ -135,17 +135,6 @@ def update_contact(user_id: str, contact_id: str, patch: dict) -> dict | None:
     return rows[0] if rows else None
 
 
-def approve_company(user_id: str, company_id: str) -> dict | None:
-    """Marks the picked people as approved for a campaign. Sending them is a separate step (not built yet)."""
-    company = get_company(user_id, company_id)
-    if not company or company["status"] not in ("ready", "approved"):
-        return None
-    stamp = now_iso()
-    _db().table(CONTACTS).update({"approved_at": stamp, "updated_at": stamp}).eq("user_id", user_id).eq("company_id", company_id).eq("selected", True).execute()
-    _db().table(COMPANIES).update({"status": "approved", "updated_at": stamp}).eq("user_id", user_id).eq("id", company_id).execute()
-    return get_company(user_id, company_id)
-
-
 # ---------- Used by the background runner ----------
 
 def update_company(company_id: str, patch: dict) -> None:

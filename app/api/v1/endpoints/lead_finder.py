@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from app.api.deps import get_current_user
 import httpx
 
-from app.schemas.lead_finder import CompaniesIn, ContactPatch, KeyIn, RetryIn, SearchIn, SettingsIn
-from app.services.lead_finder import discover, keys, runner, store
+from app.schemas.lead_finder import CompaniesIn, ContactPatch, KeyIn, MailboxIn, RetryIn, SearchIn, SettingsIn
+from app.services.lead_finder import discover, keys, mailbox, runner, store
 from app.services.lead_finder.providers import Hunter, ProviderError
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -61,12 +61,31 @@ def retry_company(company_id: str, data: RetryIn, user: dict = Depends(get_curre
     return company
 
 
-@router.post("/companies/{company_id}/approve", summary="Approve the picked people for a campaign")
-def approve_company(company_id: str, user: dict = Depends(get_current_user)):
-    company = store.approve_company(user["id"], company_id)
+@router.post("/companies/{company_id}/send", summary="Email the picked people from the user's own mailbox")
+def send_company(company_id: str, user: dict = Depends(get_current_user)):
+    company = store.get_company(user["id"], company_id)
     if not company:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Only a company that is ready to review can be approved.")
-    return company
+        raise _not_found()
+    if company["status"] not in ("ready", "approved"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "Only a company that is ready to review can be emailed.")
+    mb = _mailbox(user)
+    todo = [p for p in company["contacts"]
+            if p.get("selected") and p.get("email") and not p.get("sent_at") and p.get("email_status") != "invalid"]
+    if not todo:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Pick at least one person who hasn't been emailed yet.")
+    s = store.get_settings(user["id"])
+    msgs = [mailbox.build(mb, p["email"], p["name"], *mailbox.render(s, company, p)) for p in todo]
+    try:
+        errors = mailbox.send(mb, msgs)
+    except mailbox.MailboxError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    stamp = store.now_iso()
+    for p, msg, err in zip(todo, msgs, errors):
+        patch = {"send_error": err} if err else {"sent_at": stamp, "send_error": None, "message_id": msg["Message-ID"], "approved_at": stamp}
+        store.update_contact(user["id"], p["id"], patch)
+    if any(err is None for err in errors):
+        store.update_company(company_id, {"status": "approved"})
+    return store.get_company(user["id"], company_id)
 
 
 @router.delete("/companies/{company_id}", status_code=status.HTTP_204_NO_CONTENT, summary="Remove a company and its people")
@@ -149,6 +168,63 @@ def delete_key(provider: str, user: dict = Depends(get_current_user)):
     provider = _provider(provider)
     try:
         keys.remove(user["id"], provider)
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------- The user's own mailbox ----------
+
+def _mailbox(user: dict) -> dict:
+    try:
+        mb = mailbox.load(user["id"])
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+    if not mb:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Connect your mailbox first: Settings, under Your mailbox.")
+    return mb
+
+
+@router.get("/mailbox", summary="The mailbox emails are sent from (never its password)")
+def mailbox_status(user: dict = Depends(get_current_user)):
+    try:
+        return mailbox.status(user["id"])
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+
+
+@router.put("/mailbox", summary="Check the mailbox login and, if it works, save it (password encrypted)")
+def save_mailbox(data: MailboxIn, user: dict = Depends(get_current_user)):
+    mb = data.model_dump()
+    result = mailbox.check(mb)
+    if not result.ok:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, result.message)
+    try:
+        mailbox.save(user["id"], mb)
+        return {**mailbox.status(user["id"]), "message": result.message}
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+
+
+@router.post("/mailbox/test", summary="Send a test email to the mailbox itself")
+def test_mailbox(user: dict = Depends(get_current_user)):
+    mb = _mailbox(user)
+    body = ("This is a test email from ReachAgent.\n\nIf you can read this in your inbox, sending works. "
+            "Reply to it and the reply arrives here too, just like a reply from a company you emailed.")
+    msg = mailbox.build(mb, mb["email"], mb.get("from_name") or "", "ReachAgent test email", body)
+    try:
+        error = mailbox.send(mb, [msg])[0]
+    except mailbox.MailboxError as e:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
+    if error:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, error)
+    return {"message": f"Test email sent to {mb['email']}. Check its inbox, and its Sent folder for the copy."}
+
+
+@router.delete("/mailbox", status_code=status.HTTP_204_NO_CONTENT, summary="Disconnect the mailbox")
+def delete_mailbox(user: dict = Depends(get_current_user)):
+    try:
+        mailbox.remove(user["id"])
     except keys.KeysUnavailable as e:
         raise _unavailable(e)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
