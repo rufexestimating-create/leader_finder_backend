@@ -189,7 +189,16 @@ def _apollo(c: httpx.Client, key: str) -> Check:
                             "Upgrade to any paid Apollo plan to use it here.")
     if m.status_code == 429:
         return Check(False, "Apollo's credits or rate limit are used up for now. Try again later.")
-    return Check(True, "Connected. Apollo doesn't share its credit balance through the API: see app.apollo.io > Settings > Credits.")
+    # Usage numbers are only given to a master API key; a normal key gets 403 here
+    u = c.post("https://api.apollo.io/api/v1/usage_stats/api_usage_stats", headers=hdrs, json={})
+    if u.status_code == 200:
+        stats = u.json() or {}
+        match = next((v for k, v in stats.items() if "match" in k and isinstance(v, dict)), None)
+        day = (match or {}).get("day") or {}
+        if day.get("limit") is not None:
+            left = day.get("left_over", _num(day.get("limit")) - _num(day.get("consumed")))
+            return Check(True, f"Connected. {int(_num(left)):,} of {int(_num(day['limit'])):,} email lookups left today.")
+    return Check(True, "Connected. To see credits here, use a master API key (app.apollo.io > Settings > Integrations > API).")
 
 
 def _gplaces(c: httpx.Client, key: str) -> Check:
