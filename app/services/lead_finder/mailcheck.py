@@ -89,6 +89,16 @@ def _mx(domain: str) -> str | None:
         return None
 
 
+_receives: dict[str, bool] = {}
+
+
+def receives_email(domain: str) -> bool:
+    """The domain has a mail server (MX record). Free: one DNS lookup, cached."""
+    if domain not in _receives:
+        _receives[domain] = _mx(domain) is not None
+    return _receives[domain]
+
+
 def _ipv4(host: str) -> str:
     return socket.getaddrinfo(host, 25, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
 

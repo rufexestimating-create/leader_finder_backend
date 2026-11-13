@@ -3,11 +3,8 @@ polls GET /lead-finder/companies to watch the steps finish."""
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.deps import get_current_user
-import httpx
-
-from app.schemas.lead_finder import AgentRunIn, CompaniesIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SearchIn, SettingsIn
-from app.services.lead_finder import agent, discover, keys, mailbox, runner, store
-from app.services.lead_finder.providers import Hunter, ProviderError
+from app.schemas.lead_finder import AgentRunIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SettingsIn
+from app.services.lead_finder import agent, keys, mailbox, runner, store
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -19,30 +16,6 @@ def _not_found(what: str = "Company") -> HTTPException:
 @router.get("/companies", summary="Every company with its people and progress, newest first")
 def list_companies(user: dict = Depends(get_current_user)):
     return store.list_companies(user["id"])
-
-
-@router.post("/companies", status_code=status.HTTP_201_CREATED, summary="Add companies (form, CSV or search); they start in the background")
-def add_companies(data: CompaniesIn, user: dict = Depends(get_current_user)):
-    return store.create_companies(user["id"], [c.model_dump() for c in data.companies], data.source, data.search_id)
-
-
-@router.post("/search", summary="Find companies by filters (Hunter Discover, free); nothing is looked up until you pick some")
-def search_companies(data: SearchIn, user: dict = Depends(get_current_user)):
-    hunter_key = (keys.load(user["id"]).get("hunter") or {}).get("key")
-    if not hunter_key:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Finding companies needs your Hunter key. Add it in Settings, under Tools.")
-    if store.get_settings(user["id"]).get("tools", {}).get("hunter") is False:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Hunter is switched off in Settings, so companies can't be searched.")
-    filters = data.model_dump()
-    try:
-        with httpx.Client() as client:
-            found = discover.search(Hunter(hunter_key, client), filters, store.known_domains(user["id"]))
-    except ValueError as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
-    except ProviderError as e:
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(e))
-    found["search_id"] = store.save_search(user["id"], filters, len(found["results"]))
-    return found
 
 
 @router.get("/companies/{company_id}", summary="One company with its people and progress")
@@ -193,6 +166,11 @@ def delete_key(provider: str, user: dict = Depends(get_current_user)):
 @router.post("/agent/runs", status_code=status.HTTP_201_CREATED, summary="Start an agent run: find, read, find emails, send")
 def start_agent_run(data: AgentRunIn, user: dict = Depends(get_current_user)):
     _mailbox(user)
+    if data.mode == "smart":
+        s = store.get_settings(user["id"])
+        hunter = runner.tools_status(s, keys.load(user["id"]))["hunter"]
+        if not (hunter["connected"] and hunter["on"]):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "With enrichment needs your Hunter key: add it in Settings, under Connect your tools.")
     active = [r for r in agent.list_runs(user["id"], 5) if r["status"] in ("queued", "running")]
     if active:
         raise HTTPException(status.HTTP_409_CONFLICT, "A run is already finding companies. Wait for it to finish or stop it.")

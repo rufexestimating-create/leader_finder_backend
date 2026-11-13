@@ -7,7 +7,7 @@ from app.services.lead_finder.constants import DEFAULT_ROLES, DEFAULT_SETTINGS, 
 from app.services.lead_finder.engine import pending_steps
 from app.services.lead_finder.website import clean_domain
 
-COMPANIES, CONTACTS, SETTINGS, SEARCHES = "prospect_companies", "prospect_contacts", "prospect_settings", "prospect_searches"
+COMPANIES, CONTACTS, SETTINGS = "prospect_companies", "prospect_contacts", "prospect_settings"
 CACHE_DAYS = 30
 # A company "Finding details" for longer than this was cut off (the server restarted) and is put back in the queue
 STUCK_MINUTES = 15
@@ -76,43 +76,32 @@ def company_row(user_id: str, data: dict, source: str, search_id: str | None = N
     }
 
 
+# Each company with its people, and the mode of the agent run that found it ("fast" = without enrichment)
+WITH_CONTACTS = f"*, {CONTACTS}(*), prospect_agent_runs(mode)"
+
+
 def _with_contacts(row: dict) -> dict:
     contacts = row.pop(CONTACTS, None) or []
     row["contacts"] = sorted(contacts, key=lambda c: c.get("created_at") or "")
+    row["agent_mode"] = (row.pop("prospect_agent_runs", None) or {}).get("mode")
     return row
 
 
 def list_companies(user_id: str, limit: int = 500) -> list[dict]:
-    rows = (_db().table(COMPANIES).select(f"*, {CONTACTS}(*)").eq("user_id", user_id)
+    rows = (_db().table(COMPANIES).select(WITH_CONTACTS).eq("user_id", user_id)
             .order("created_at", desc=True).limit(limit).execute().data)
     return [_with_contacts(r) for r in rows]
 
 
 def get_company(user_id: str, company_id: str) -> dict | None:
-    rows = _db().table(COMPANIES).select(f"*, {CONTACTS}(*)").eq("user_id", user_id).eq("id", company_id).limit(1).execute().data
+    rows = _db().table(COMPANIES).select(WITH_CONTACTS).eq("user_id", user_id).eq("id", company_id).limit(1).execute().data
     return _with_contacts(rows[0]) if rows else None
-
-
-def create_companies(user_id: str, entries: list[dict], source: str, search_id: str | None = None) -> list[dict]:
-    rows = [company_row(user_id, e, source, search_id) for e in entries]
-    created = _db().table(COMPANIES).insert(rows).execute().data
-    return [{**c, "contacts": []} for c in created]
 
 
 def known_domains(user_id: str) -> set[str]:
     """Websites of every company already in Lead Finder"""
     rows = _db().table(COMPANIES).select("domain").eq("user_id", user_id).not_.is_("domain", "null").limit(5000).execute().data
     return {r["domain"] for r in rows if r.get("domain")}
-
-
-def save_search(user_id: str, filters: dict, result_count: int) -> str | None:
-    """Remembers what was searched, so the companies picked from it can point back to it. Never blocks a search."""
-    try:
-        rows = _db().table(SEARCHES).insert({"user_id": user_id, "filters": filters, "result_count": result_count}).execute().data
-        return rows[0]["id"] if rows else None
-    except Exception as e:  # the search itself worked; losing its history isn't worth failing it
-        print(f"[lead finder] couldn't save the search: {e}", flush=True)
-        return None
 
 
 def delete_company(user_id: str, company_id: str) -> bool:

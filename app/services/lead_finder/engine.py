@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 from urllib.parse import quote_plus
 
+from app.services.lead_finder import mailcheck
 from app.services.lead_finder import news as news_mod
 from app.services.lead_finder import people as people_mod
 from app.services.lead_finder import writer as writer_mod
@@ -288,6 +289,14 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
                     p["linkedin"] = p.get("linkedin") or pdl_data.get("linkedin")
             except Exception:
                 pass
+    # Nobody named: the company's own address on its website (info@, office@) is still worth checking and emailing
+    company_email = None
+    if not chosen:
+        own = [e for e in site.emails if website._same_site(e.split("@")[1], domain)]
+        company_email = next((e for e in own if mailcheck.is_role(e)), own[0] if own else None)
+        if company_email:
+            chosen = [{"name": name, "title": "Company email", "email": company_email, "email_source": "Website",
+                       "linkedin": None, "status": "unknown"}]
     if not chosen:
         note = "No one matching your roles was found"
         if site.emails:
@@ -298,7 +307,8 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
         steps.skip_rest("people", "Nothing to do: no people found")
         return finish([])
     for_kind = f" for {_article(kind)} {kind}" if kind else ""
-    note = f"{len(chosen)} {'person matches' if len(chosen) == 1 else 'people match'} your roles{for_kind}"
+    note = (f"No one matching your roles was found, so the company email from the website is used: {company_email}" if company_email
+            else f"{len(chosen)} {'person matches' if len(chosen) == 1 else 'people match'} your roles{for_kind}")
     steps.done("people", note + (f". {people_problem}" if people_problem else ""))
 
     # ---------- 6. Their emails ----------

@@ -135,7 +135,9 @@ def check(mb: dict) -> keys.Check:
 
 def render(settings: dict, company: dict, contact: dict) -> tuple[str, str]:
     """Subject and body exactly as the email preview shows them"""
-    first = (contact.get("name") or "").split(" ")[0]
+    # A company address (info@) is greeted as the team, not by the company's first word
+    first = (f"{company.get('name') or ''} team" if contact.get("title") == "Company email"
+             else (contact.get("name") or "").split(" ")[0])
     line = (contact.get("personal_line") or "").strip()
 
     def fill(text: str) -> str:

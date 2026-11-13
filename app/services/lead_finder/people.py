@@ -1,8 +1,12 @@
 """Who to email at a company: everyone Hunter and the website name, ranked by the job titles in Settings (best first)."""
 import re
 
+from app.services.lead_finder.website import looks_like_person
+
 # Hunter's seniority, when no job title matches
 _SENIORITY = {"executive": 0, "senior": 1, "junior": 2}
+# A title on the website that makes someone a decision maker even when it isn't in the user's list
+_LEADER = re.compile(r"\b(ceo|chief|founder|co-founder|owner|president|principal|partner|managing director|director|vp|vice president|head of)\b", re.I)
 
 
 # "Vice President" is not the President, nor "Assistant Project Manager" the Project Manager
@@ -37,7 +41,7 @@ def rank(hunter_people: list[dict], site_people: list[dict], roles: list[str], l
         if p.get("type") == "generic":  # info@, sales@: not a person
             continue
         name = " ".join(f"{p.get('first_name') or ''} {p.get('last_name') or ''}".split())
-        if len(name.split()) < 2:
+        if not looks_like_person(name):  # Hunter sometimes reads a heading as a person ("EMPLOYEE- STORIES")
             continue
         people[name.lower()] = {
             "name": name, "title": p.get("title") or "", "email": p.get("email"), "email_source": "Hunter" if p.get("email") else None,
@@ -46,12 +50,15 @@ def rank(hunter_people: list[dict], site_people: list[dict], roles: list[str], l
             "_confidence": p.get("confidence") or 0,
         }
     for p in site_people:
+        if not looks_like_person(p["name"]):
+            continue
         key = p["name"].lower()
         if key in people:
             people[key]["title"] = people[key]["title"] or p.get("title") or ""
         else:
+            leader = bool(_LEADER.search(p.get("title") or ""))
             people[key] = {"name": p["name"], "title": p.get("title") or "", "email": None, "email_source": None, "linkedin": None,
-                           "status": "unknown", "_seniority": 3, "_decider": False, "_confidence": 0}
+                           "status": "unknown", "_seniority": 0 if leader else 3, "_decider": leader, "_confidence": 0}
 
     matched, others = [], []
     for order, p in enumerate(people.values()):

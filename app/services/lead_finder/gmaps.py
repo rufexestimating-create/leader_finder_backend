@@ -37,7 +37,7 @@ def search(query: str, limit: int, timeout: int = 900) -> list[dict]:
                "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(limit)),
                "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"]
         try:
-            done = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
             raise MapsError("Google Maps took too long to answer. Try again in a few minutes.")
         out = Path(tmp, "results.csv")

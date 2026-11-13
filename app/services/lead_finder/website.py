@@ -419,6 +419,9 @@ _NOT_NAME = {
     "employee", "stories", "simulation", "family", "homes", "home", "remodeling", "renovation", "roofing", "plumbing",
     "electrical", "concrete", "custom", "quality", "best", "top", "award", "awards", "years", "experience", "skip", "main",
     "content", "menu", "click", "here", "partners", "clients", "testimonials", "reviews", "review", "river", "oaks",
+    # Blog headlines and site authors ("How to Avoid the Pitfalls … Owner-Investor's Guide", "Jorge Admin")
+    "guide", "admin", "administrator", "investor", "investors", "biggest", "multifamily", "pitfalls", "avoid", "how", "why",
+    "what", "tips", "blog", "news", "post", "posted", "author", "editor", "webmaster", "renovations", "remodel",
 }
 # Lines that quote a customer, not someone who works there
 _REVIEWER = re.compile(r"\b(home\s?owner|homeowner|customer|client|review|testimonial|satisfied)\b", re.I)
@@ -433,8 +436,28 @@ def _name_in(text: str, exclude: set[str]) -> str | None:
         # "EMPLOYEE STORIES", "AVT Simulation": a real name isn't shouted in capitals
         if any(len(w) > 3 and w.isupper() for w in name.replace(".", "").split()):
             continue
+        # "Investor’s Guide": a possessive is a phrase, not a name
+        if re.search(r"['’]s\b", name):
+            continue
         return name
     return None
+
+
+def looks_like_person(name: str) -> bool:
+    """A real person's name: two or three words of letters, not shouted in capitals, no heading words
+    ("EMPLOYEE- STORIES", "Investor's Guide", "Site Work" are not people, whoever reported them)"""
+    words = (name or "").replace(".", " ").split()
+    if not 2 <= len(words) <= 4:
+        return False
+    for w in words:
+        bare = w.strip("'’-")
+        if not bare or not re.fullmatch(r"[A-Za-zÀ-ÿ'’-]+", w) or w.endswith("-"):
+            return False
+        if len(bare) > 3 and bare.isupper():
+            return False
+        if bare.lower() in _NOT_NAME:
+            return False
+    return not re.search(r"['’]s\b", name)
 
 
 def clean_title(title: str) -> str:
@@ -473,7 +496,9 @@ def people(pages: list[Parsed], company_name: str = "", city: str = "") -> list[
             kind = item.get("@type")
             kinds = kind if isinstance(kind, list) else [kind]
             if "Person" in kinds and isinstance(item.get("name"), str) and len(item["name"].split()) >= 2:
-                add(item["name"].strip(), str(item.get("jobTitle") or ""), p.url)
+                clean = _name_in(item["name"].strip(), exclude)  # a blog's author schema ("Jorge Admin") is not staff
+                if clean == " ".join(item["name"].split()):
+                    add(clean, str(item.get("jobTitle") or ""), p.url)
         for i, line in enumerate(p.lines):
             if len(line) > 120:
                 continue

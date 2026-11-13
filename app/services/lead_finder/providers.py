@@ -110,31 +110,6 @@ class Hunter:
             "people": people,
         }
 
-    DISCOVER_MESSAGES = {
-        "no_discover_access": "Your Hunter plan doesn't include company search (Discover).",
-        "invalid_headcount": "Hunter doesn't know that company size.",
-        "invalid_headquarters_location_include_state": "Hunter can't search that state: pick a city instead.",
-        "pagination_error": "Hunter can't return that many companies on your plan.",
-    }
-
-    def discover(self, body: dict) -> dict:
-        """Companies matching the filters (free, no credits): {companies: [{name, domain, emails}], total}"""
-        try:
-            res = _call("Hunter", lambda: self.client.post(f"{self.BASE}/discover", json=body, headers=self.headers, timeout=TIMEOUT))
-        except ProviderError as e:
-            if e.code in self.DISCOVER_MESSAGES:
-                raise ProviderError(self.DISCOVER_MESSAGES[e.code], fatal=e.fatal, code=e.code)
-            raise
-        j = res.json() or {}
-        return {
-            "companies": [
-                {"name": d.get("organization") or d.get("domain") or "", "domain": d.get("domain") or "",
-                 "emails": int((d.get("emails_count") or {}).get("total") or 0)}
-                for d in j.get("data") or [] if d.get("domain")
-            ],
-            "total": int((j.get("meta") or {}).get("results") or 0),
-        }
-
     def email_finder(self, domain: str, first_name: str, last_name: str) -> dict | None:
         """The most likely email for one person, or None when Hunter has no answer (no credit is used then)"""
         params = {"domain": domain, "first_name": first_name, "last_name": last_name}
