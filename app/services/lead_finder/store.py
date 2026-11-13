@@ -33,8 +33,11 @@ def get_settings(user_id: str) -> dict:
         row = rows[0]
         s["roles"].update({k: v for k, v in (row.get("roles") or {}).items() if isinstance(v, list)})
         s["tools"].update(row.get("tools") or {})
-        for key in ("skip_sites", "templates", "subject", "message", "daily_limit", "at_once"):
+        for key in ("skip_sites", "templates", "subject", "message", "daily_limit", "at_once", "emails_per_day"):
             if row.get(key) is not None:
+                s[key] = row[key]
+        for key in ("agent_subject", "agent_message"):
+            if (row.get(key) or "").strip():
                 s[key] = row[key]
         # Saved while the message was still a placeholder: use the real message and its opening-line templates
         if OLD_PLACEHOLDER in (row.get("message") or ""):

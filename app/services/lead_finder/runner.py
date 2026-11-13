@@ -12,7 +12,7 @@ import httpx
 
 from app.core.config import settings as app_settings
 from app.db.supabase import is_supabase_configured
-from app.services.lead_finder import engine, keys, store, website
+from app.services.lead_finder import agent, engine, keys, store, website
 from app.services.lead_finder.providers import Apollo, GooglePlacesAPI, Hunter, PDL, ReoonVerifier, Serper
 from app.services.lead_finder.writer import Writer
 
@@ -106,6 +106,25 @@ def _log_once(message: str) -> None:
     if message != _last_error:
         print(f"[lead finder] {message}", flush=True)
         _last_error = message
+
+
+AGENT_INTERVAL_SECONDS = 5
+
+
+async def agent_loop() -> None:
+    """ReachAgent's automatic runs: starts searches and sends their emails one at a time"""
+    if not app_settings.RUN_LEAD_FINDER or not is_supabase_configured():
+        return
+    try:
+        await asyncio.to_thread(agent.recover)
+    except Exception as e:  # the table may not exist yet
+        _log_once(f"agent: {type(e).__name__}: {e}")
+    while True:
+        try:
+            await asyncio.to_thread(agent.tick)
+        except Exception as e:
+            _log_once(f"agent: {type(e).__name__}: {e}")
+        await asyncio.sleep(AGENT_INTERVAL_SECONDS)
 
 
 async def lead_finder_loop() -> None:

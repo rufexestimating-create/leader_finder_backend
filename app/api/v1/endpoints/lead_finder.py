@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException, Response, status
 from app.api.deps import get_current_user
 import httpx
 
-from app.schemas.lead_finder import CompaniesIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SearchIn, SettingsIn
-from app.services.lead_finder import discover, keys, mailbox, runner, store
+from app.schemas.lead_finder import AgentRunIn, CompaniesIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SearchIn, SettingsIn
+from app.services.lead_finder import agent, discover, keys, mailbox, runner, store
 from app.services.lead_finder.providers import Hunter, ProviderError
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -186,6 +186,37 @@ def delete_key(provider: str, user: dict = Depends(get_current_user)):
     except keys.KeysUnavailable as e:
         raise _unavailable(e)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ---------- ReachAgent's automatic runs ----------
+
+@router.post("/agent/runs", status_code=status.HTTP_201_CREATED, summary="Start an agent run: find, read, find emails, send")
+def start_agent_run(data: AgentRunIn, user: dict = Depends(get_current_user)):
+    _mailbox(user)
+    active = [r for r in agent.list_runs(user["id"], 5) if r["status"] in ("queued", "running")]
+    if active:
+        raise HTTPException(status.HTTP_409_CONFLICT, "A run is already finding companies. Wait for it to finish or stop it.")
+    return agent.start(user["id"], data.model_dump())
+
+
+@router.get("/agent/runs", summary="The latest agent runs, newest first")
+def list_agent_runs(user: dict = Depends(get_current_user)):
+    return agent.list_runs(user["id"])
+
+
+@router.get("/agent/runs/{run_id}", summary="One agent run with its companies and progress")
+def get_agent_run(run_id: str, user: dict = Depends(get_current_user)):
+    run = agent.get(user["id"], run_id)
+    if not run:
+        raise _not_found("Run")
+    return run
+
+
+@router.post("/agent/runs/{run_id}/stop", summary="Stop an agent run")
+def stop_agent_run(run_id: str, user: dict = Depends(get_current_user)):
+    if not agent.stop(user["id"], run_id):
+        raise HTTPException(status.HTTP_409_CONFLICT, "This run has already finished.")
+    return agent.get(user["id"], run_id)
 
 
 # ---------- The user's own mailbox ----------

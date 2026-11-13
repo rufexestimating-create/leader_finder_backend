@@ -118,6 +118,27 @@ class MailboxIn(BaseModel):
         return v.strip()
 
 
+class AgentRunIn(BaseModel):
+    mode: Literal["fast"] = "fast"
+    country: str = Field(min_length=2, max_length=60)
+    state: str = Field("", max_length=60)
+    city: str = Field(min_length=2, max_length=80)
+    company_type: str
+    limit: int = Field(20, ge=5, le=50)
+
+    @field_validator("company_type")
+    @classmethod
+    def known_type(cls, v: str) -> str:
+        if v not in COMPANY_TYPES:
+            raise ValueError("unknown company type")
+        return v
+
+    @field_validator("country", "state", "city")
+    @classmethod
+    def trimmed(cls, v: str) -> str:
+        return v.strip()
+
+
 class MailboxModeIn(BaseModel):
     test_mode: bool
 
@@ -146,6 +167,9 @@ class SettingsIn(BaseModel):
     daily_limit: int = Field(50, ge=1, le=500)
     at_once: int = Field(2, ge=1, le=5)
     tools: dict[str, bool] = Field(default_factory=dict)
+    agent_subject: str = Field("", max_length=200)
+    agent_message: str = Field("", max_length=5000)
+    emails_per_day: int = Field(30, ge=1, le=200)
 
     @field_validator("roles")
     @classmethod

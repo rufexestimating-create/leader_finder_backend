@@ -293,11 +293,38 @@ _TECH = (("WordPress", ("wp-content", "wp-includes")), ("Wix", ("wixstatic.com",
          ("Weebly", ("weebly",)), ("Duda", ("multiscreensite", "dudaone")))
 
 
+_CF_EMAIL = re.compile(r'data-cfemail="([0-9a-f]{8,})"|/cdn-cgi/l/email-protection#([0-9a-f]{8,})', re.I)
+# "john [at] acme [dot] com", "john(at)acme(dot)com", "john at acme dot com"
+_OBFUSCATED = re.compile(
+    r"([a-z0-9][a-z0-9._%+-]{0,63})\s*(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}|\s+at\s+)\s*"
+    r"([a-z0-9-]+(?:\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\s+dot\s+|\.)\s*[a-z0-9-]+)+)", re.I)
+_DOT = re.compile(r"\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|\s+dot\s+)\s*", re.I)
+
+
+def _cloudflare(hexed: str) -> str:
+    """Cloudflare hides emails as hex XOR-ed with the first byte"""
+    try:
+        key = int(hexed[:2], 16)
+        return "".join(chr(int(hexed[i:i + 2], 16) ^ key) for i in range(2, len(hexed), 2))
+    except ValueError:
+        return ""
+
+
+def _hidden_emails(p: Parsed) -> list[str]:
+    out = [_cloudflare(a or b) for a, b in _CF_EMAIL.findall(p.html)]
+    for line in p.lines:
+        if len(line) > 200:
+            continue
+        for user, host in _OBFUSCATED.findall(line):
+            out.append(f"{user}@{_DOT.sub('.', host)}")
+    return out
+
+
 def emails(pages: list[Parsed], domain: str) -> list[str]:
     """Every email on the pages, the company's own domain first"""
     found: list[str] = []
     for p in pages:
-        sources = [h[7:].split("?")[0] for h, _ in p.links if h.lower().startswith("mailto:")] + p.lines
+        sources = [h[7:].split("?")[0] for h, _ in p.links if h.lower().startswith("mailto:")] + p.lines + _hidden_emails(p)
         for text in sources:
             for m in _EMAIL.findall(text):
                 e = m.lower().strip(".")
@@ -387,7 +414,14 @@ _NOT_NAME = {
     "officer", "general", "operations", "managing", "sales", "marketing", "office", "phone", "email", "call", "today", "free",
     "quote", "pvt", "limited", "private", "our", "leadership", "management", "staff", "people", "welcome", "and", "of",
     "new", "york", "united", "states", "estimating", "preconstruction", "development", "business", "customer", "client",
+    # Headings and phrases that look like names next to a title word ("Trusted Local Partner", "Site Work Principal")
+    "trusted", "local", "site", "work", "commercial", "residential", "real", "estate", "success", "start", "explore", "careers",
+    "employee", "stories", "simulation", "family", "homes", "home", "remodeling", "renovation", "roofing", "plumbing",
+    "electrical", "concrete", "custom", "quality", "best", "top", "award", "awards", "years", "experience", "skip", "main",
+    "content", "menu", "click", "here", "partners", "clients", "testimonials", "reviews", "review", "river", "oaks",
 }
+# Lines that quote a customer, not someone who works there
+_REVIEWER = re.compile(r"\b(home\s?owner|homeowner|customer|client|review|testimonial|satisfied)\b", re.I)
 
 
 def _name_in(text: str, exclude: set[str]) -> str | None:
@@ -396,8 +430,17 @@ def _name_in(text: str, exclude: set[str]) -> str | None:
         words = [w.strip(".").lower() for w in name.split()]
         if any(w in _NOT_NAME or w in exclude for w in words) or len(name) > 40:
             continue
+        # "EMPLOYEE STORIES", "AVT Simulation": a real name isn't shouted in capitals
+        if any(len(w) > 3 and w.isupper() for w in name.replace(".", "").split()):
+            continue
         return name
     return None
+
+
+def clean_title(title: str) -> str:
+    """'Founder of RJT Construction | Houston, TX Skip to main content' -> 'Founder of RJT Construction'"""
+    title = re.split(r"\s[|•·]\s|\bskip to\b", title, maxsplit=1, flags=re.I)[0]
+    return title.strip(" ,|–-:;()")[:80]
 
 
 def _ld_items(data) -> list[dict]:
@@ -422,8 +465,8 @@ def people(pages: list[Parsed], company_name: str = "", city: str = "") -> list[
 
     def add(name: str, title: str, url: str):
         key = name.lower()
-        if key not in found:
-            found[key] = {"name": name, "title": title.strip(" ,|–-:")[:80], "source": url}
+        if key not in found and not _REVIEWER.search(title):
+            found[key] = {"name": name, "title": clean_title(title), "source": url}
 
     for p in pages:
         for item in _ld_items(p.jsonld):

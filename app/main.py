@@ -8,14 +8,16 @@ from postgrest.exceptions import APIError
 
 from app.core.config import settings
 from app.api.v1.api import api_router
-from app.services.lead_finder.runner import lead_finder_loop
+from app.services.lead_finder.runner import agent_loop, lead_finder_loop
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     lead_finder = asyncio.create_task(lead_finder_loop())
+    agent = asyncio.create_task(agent_loop())
     yield
     lead_finder.cancel()
+    agent.cancel()
 
 
 app = FastAPI(

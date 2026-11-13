@@ -90,6 +90,17 @@ DEFAULT_SETTINGS = {
     ),
     "daily_limit": 50,
     "at_once": 2,
+    # The agent's message when nothing is looked up ("without enrichment"). {{greeting}} is "Hi Alfonso," when the
+    # website names someone, else "Hi CTC Contractors team,".
+    "agent_subject": "Drafting support for {{company}}",
+    "agent_message": (
+        "{{greeting}}\n\nMany of your clients need expert permit plans and drafting services, while our clients often need "
+        "trusted contractors. We specialize in permit-ready plans, drafting, and renderings, with years of experience and a "
+        "proven track record of successful projects. We can provide work samples and client references upon request. In "
+        "return, we will refer construction opportunities to your company and offer referral fees for every successful "
+        "referral and creating new business opportunities for both of us.\n\nGary | Design Head\nCADTRI | (737) 237-2736"
+    ),
+    "emails_per_day": 30,
     "tools": {"hunter": True, "serper": True, "verifier": True, "places": True, "ai": True,
               "apollo": True, "gplaces": True, "openai": True, "pdl": True},
 }
