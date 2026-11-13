@@ -548,14 +548,15 @@ def _follow_enrichment(run: dict) -> None:
         for c in done:
             if c["domain"] not in (counts.get("done_domains") or []):
                 found = [p for p in (c.get(store.CONTACTS) or []) if p.get("selected") and p.get("email")]
-                _add_log(counts, f"{c['domain']}: " + (f"{len(found)} verified ({', '.join(p['email'] for p in found[:3])})"
-                                                       if found else "no verified email" if c["status"] != "failed" else "couldn't finish"))
+                tag = lambda p: f"{p['email']} ({'verified' if p['email_status'] == 'valid' else 'risky, catch-all'})"  # noqa: E731
+                _add_log(counts, f"{c['domain']}: " + (f"picked {', '.join(tag(p) for p in found[:3])}"
+                                                       if found else "no usable email" if c["status"] != "failed" else "couldn't finish"))
                 counts["done_domains"] = (counts.get("done_domains") or []) + [c["domain"]]
     working = next((c["domain"] for c in cos if c["status"] == "enriching"), None)
     counts.update(read=len(done), people=len(people), emails=len(picked), current=working)
     for s in steps:
         if s["id"] == "enrich":
-            s["note"] = f"{len(done)} of {total} done, {len(picked)} verified email{'' if len(picked) == 1 else 's'} picked"
+            s["note"] = f"{len(done)} of {total} done, {len(picked)} email{'' if len(picked) == 1 else 's'} picked"
             if len(done) == total:
                 s["state"] = "done"
     patch = {"counts": counts, "steps": steps}

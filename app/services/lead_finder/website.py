@@ -422,6 +422,9 @@ _NOT_NAME = {
     # Blog headlines and site authors ("How to Avoid the Pitfalls … Owner-Investor's Guide", "Jorge Admin")
     "guide", "admin", "administrator", "investor", "investors", "biggest", "multifamily", "pitfalls", "avoid", "how", "why",
     "what", "tips", "blog", "news", "post", "posted", "author", "editor", "webmaster", "renovations", "remodel",
+    # Departments and job areas that sit where a name would ("Facility Maintenance", "Customer Care")
+    "facility", "facilities", "maintenance", "department", "care", "support", "accounts", "accounting", "billing", "hr",
+    "human", "resources", "careers", "jobs", "hiring", "safety", "warranty", "dispatch", "scheduling", "procurement",
 }
 # Lines that quote a customer, not someone who works there
 _REVIEWER = re.compile(r"\b(home\s?owner|homeowner|customer|client|review|testimonial|satisfied)\b", re.I)

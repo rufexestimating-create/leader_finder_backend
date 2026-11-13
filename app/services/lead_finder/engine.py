@@ -390,9 +390,13 @@ def enrich(company: dict, settings: dict, tools: Tools, save: Callable[[dict], N
             how = ai_problem + 'No template fit, so the message starts without a personal line'
     steps.done("line", how)
 
+    # Every verified person is picked. With none, the best risky one (catch-all: the server accepts any address, so it
+    # doesn't bounce) is picked instead, one per company; `chosen` is already best first.
+    risky_pick = None if any(p["email_status"] == "valid" for p in chosen) else next(
+        (i for i, p in enumerate(chosen) if p["email_status"] == "catch_all"), None)
     contacts = [{
         "name": p["name"], "title": p.get("title") or None, "email": p.get("email"), "email_status": p["email_status"],
         "email_source": p.get("email_source") or None, "linkedin": p.get("linkedin"), "verified_at": p.get("verified_at"),
-        "personal_line": line if p["email_status"] != "invalid" else "", "selected": p["email_status"] == "valid",
-    } for p in chosen]
+        "personal_line": line if p["email_status"] != "invalid" else "", "selected": p["email_status"] == "valid" or i == risky_pick,
+    } for i, p in enumerate(chosen)]
     return finish(contacts)
