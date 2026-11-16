@@ -52,7 +52,7 @@ STEPS = {
     "bulk": [("check", "Check every email on your list"), ("save", "Save the list"), ("send", "Send your message")],
 }
 _EMAIL = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9-]+)*\.[a-z]{2,24}$")
-TEST_GAP = (10, 20)       # seconds between test emails (they all go to you)
+TEST_GAP = (55, 70)       # seconds between test emails (they all go to you)
 REAL_GAP = (60, 180)      # seconds between real emails
 BOUNCE_LIMIT = 3
 _LEAD = ("owner", "founder", "president", "ceo", "principal", "partner", "managing")
