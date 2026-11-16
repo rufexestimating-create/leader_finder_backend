@@ -151,9 +151,12 @@ def mailbox_exists(d: DomainCheck, email: str) -> bool:
     return d.cache[email]
 
 
-def find_email(d: DomainCheck, name: str, domain: str, pattern: str | None = None) -> str | None:
-    """The guess the company's server confirms, or None"""
+def find_email(d: DomainCheck, name: str, domain: str, pattern: str | None = None, deadline: float | None = None) -> str | None:
+    """The guess the company's server confirms, or None. Stops at `deadline` (time.monotonic()): a slow mail server
+    answering every guess at its own pace would otherwise hold up the whole run."""
     for e in guesses(name, domain, pattern):
+        if deadline is not None and time.monotonic() > deadline:
+            break
         if mailbox_exists(d, e):
             return e
         if not d.verifiable:

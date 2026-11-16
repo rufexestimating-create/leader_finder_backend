@@ -29,6 +29,7 @@ import logging
 import random
 import re
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -55,6 +56,7 @@ _EMAIL = re.compile(r"^[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9](?:[a-z0-9-]*[a-z0-9]
 TEST_GAP = (55, 70)       # seconds between test emails (they all go to you)
 REAL_GAP = (60, 180)      # seconds between real emails
 BOUNCE_LIMIT = 3
+EMAIL_CHECK_SECONDS = 60  # per company, for confirming guessed emails with its mail server
 _LEAD = ("owner", "founder", "president", "ceo", "principal", "partner", "managing")
 
 _thread: threading.Thread | None = None
@@ -196,11 +198,12 @@ def _pick_contact(company: dict, domain: str, site: website.SiteData) -> tuple[d
             return person(p, e, "unknown", "Website"), f"{p['name']}'s email is on the website"
     note = ""
     if people:
+        deadline = time.monotonic() + EMAIL_CHECK_SECONDS
         d = mailcheck.check_domain(domain)
         if d.verifiable:
             pattern = mailcheck.learn_pattern(own, people, domain)
             for p in people[:2]:
-                e = mailcheck.find_email(d, p["name"], domain, pattern)
+                e = mailcheck.find_email(d, p["name"], domain, pattern, deadline)
                 if e:
                     return (person(p, e, "valid", "Guessed from the name, confirmed by their mail server"),
                             f"{p['name']}'s email confirmed by their mail server")
