@@ -3,7 +3,7 @@ polls GET /lead-finder/companies to watch the steps finish."""
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.deps import get_current_user
-from app.schemas.lead_finder import AgentRunIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SettingsIn
+from app.schemas.lead_finder import AgentRunIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SendSmtpIn, SettingsIn
 from app.services.lead_finder import agent, keys, mailbox, runner, store
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -262,6 +262,29 @@ def set_mailbox_mode(data: MailboxModeIn, user: dict = Depends(get_current_user)
 def delete_mailbox(user: dict = Depends(get_current_user)):
     try:
         mailbox.remove(user["id"])
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.put("/mailbox/smtp", summary="Check the sending server (Brevo etc.) and save it")
+def save_send_smtp(data: SendSmtpIn, user: dict = Depends(get_current_user)):
+    _mailbox(user)
+    result = mailbox.check_send_smtp(data.model_dump())
+    if not result.ok:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, result.message)
+    try:
+        mailbox.save_send_smtp(user["id"], data.model_dump())
+        return {**mailbox.status(user["id"]), "message": result.message}
+    except keys.KeysUnavailable as e:
+        raise _unavailable(e)
+
+
+@router.delete("/mailbox/smtp", status_code=status.HTTP_204_NO_CONTENT, summary="Remove the sending server override")
+def delete_send_smtp(user: dict = Depends(get_current_user)):
+    _mailbox(user)
+    try:
+        mailbox.remove_send_smtp(user["id"])
     except keys.KeysUnavailable as e:
         raise _unavailable(e)
     return Response(status_code=status.HTTP_204_NO_CONTENT)

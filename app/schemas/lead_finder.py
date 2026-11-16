@@ -87,6 +87,18 @@ class MailboxModeIn(BaseModel):
     test_to: str | None = Field(None, max_length=254, pattern=r"^$|^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
+class SendSmtpIn(BaseModel):
+    send_host: str = Field(default="smtp-relay.brevo.com", min_length=3, max_length=255)
+    send_port: int = Field(default=587, ge=1, le=65535)
+    send_user: str = Field(min_length=3, max_length=254)
+    send_pass: str = Field(min_length=8, max_length=300)
+
+    @field_validator("send_host", "send_user")
+    @classmethod
+    def trimmed(cls, v: str) -> str:
+        return v.strip()
+
+
 class RetryIn(BaseModel):
     website: str = Field("", max_length=255)
 

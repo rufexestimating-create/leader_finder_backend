@@ -46,7 +46,9 @@ def status(user_id: str) -> dict:
         return {"connected": False}
     return {"connected": True, "email": r["email"], "from_name": r.get("from_name") or "", "smtp_host": r["smtp_host"],
             "smtp_port": r["smtp_port"], "imap_host": r.get("imap_host") or "", "imap_port": r.get("imap_port") or 993,
-            "test_mode": is_test(r), "test_to": test_address(r)}
+            "test_mode": is_test(r), "test_to": test_address(r),
+            "send_host": r.get("send_host") or "", "send_port": r.get("send_port") or 587,
+            "send_user": r.get("send_user") or ""}
 
 
 def is_test(r: dict) -> bool:
@@ -79,7 +81,14 @@ def load(user_id: str) -> dict | None:
     """The mailbox with its password readable, or None when none is saved (or it can't be decrypted)"""
     r = _row(user_id)
     password = keys.decrypt(r["password_encrypted"]) if r else None
-    return {**r, "password": password} if password else None
+    if not password:
+        return None
+    mb = {**r, "password": password}
+    if r.get("send_pass_encrypted"):
+        send_pass = keys.decrypt(r["send_pass_encrypted"])
+        if send_pass:
+            mb["send_pass"] = send_pass
+    return mb
 
 
 def save(user_id: str, mb: dict) -> None:
@@ -104,17 +113,58 @@ def remove(user_id: str) -> None:
         raise keys.KeysUnavailable("The mailbox couldn't be removed.")
 
 
+def save_send_smtp(user_id: str, data: dict) -> None:
+    """Save the external sending server (e.g. Brevo). Password encrypted like the mailbox password."""
+    row = {"send_host": data["send_host"], "send_port": data["send_port"],
+           "send_user": data["send_user"], "send_pass_encrypted": keys.encrypt(data["send_pass"])}
+    try:
+        get_supabase().table(TABLE).update(row).eq("user_id", user_id).execute()
+    except Exception as e:
+        log.warning("send smtp could not be saved: %s", type(e).__name__)
+        raise keys.KeysUnavailable("The sending server couldn't be saved: run backend/migrations/007_brevo_smtp.sql in Supabase.")
+
+
+def remove_send_smtp(user_id: str) -> None:
+    try:
+        get_supabase().table(TABLE).update(
+            {"send_host": None, "send_port": None, "send_user": None, "send_pass_encrypted": None}
+        ).eq("user_id", user_id).execute()
+    except Exception as e:
+        log.warning("send smtp could not be removed: %s", type(e).__name__)
+        raise keys.KeysUnavailable("The sending server couldn't be removed.")
+
+
 # ---------- Connecting ----------
 
 def _smtp(mb: dict) -> smtplib.SMTP:
     ctx = ssl.create_default_context()
-    if int(mb["smtp_port"]) == 465:
-        s = smtplib.SMTP_SSL(mb["smtp_host"], int(mb["smtp_port"]), context=ctx, timeout=TIMEOUT)
+    # Use external sending server (e.g. Brevo) when configured; otherwise use the mailbox's own SMTP
+    host = mb.get("send_host") or mb["smtp_host"]
+    port = int(mb.get("send_port") or mb["smtp_port"])
+    user = mb.get("send_user") or mb["email"]
+    pw   = mb.get("send_pass") or mb["password"]
+    if port == 465:
+        s = smtplib.SMTP_SSL(host, port, context=ctx, timeout=TIMEOUT)
     else:
-        s = smtplib.SMTP(mb["smtp_host"], int(mb["smtp_port"]), timeout=TIMEOUT)
+        s = smtplib.SMTP(host, port, timeout=TIMEOUT)
         s.starttls(context=ctx)
-    s.login(mb["email"], mb["password"])
+    s.login(user, pw)
     return s
+
+
+def check_send_smtp(data: dict) -> keys.Check:
+    """Test the external sending server credentials. Never raises."""
+    where = f"{data['send_host']}:{data['send_port']}"
+    mb = {"smtp_host": data["send_host"], "smtp_port": data["send_port"],
+          "email": data["send_user"], "password": data["send_pass"]}
+    try:
+        with _smtp(mb):
+            pass
+    except smtplib.SMTPAuthenticationError:
+        return keys.Check(False, f"The sending server at {where} didn't accept this login. Check the SMTP login and key.")
+    except (OSError, smtplib.SMTPException):
+        return keys.Check(False, f"Couldn't connect to {where}. Check the host and port.")
+    return keys.Check(True, f"Connected to {where}. Emails will go out through it.")
 
 
 def _imap(mb: dict) -> imaplib.IMAP4_SSL:
@@ -131,7 +181,7 @@ def check(mb: dict) -> keys.Check:
             pass
     except smtplib.SMTPAuthenticationError:
         return keys.Check(False, "The mailbox didn't accept this email and password. Check them in your Hostinger email settings.")
-    except (OSError, smtplib.SMTPException):
+    except (OSError, smtplib.SMTPException) as e:
         return keys.Check(False, f"Couldn't connect to the outgoing server {where}. Check the SMTP server and port.")
     if mb.get("imap_host"):
         try:
