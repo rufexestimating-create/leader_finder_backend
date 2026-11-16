@@ -427,66 +427,76 @@ def _search(row: dict) -> None:
         settings = store.get_settings(uid)
         smart = row.get("mode") == "smart"
         limit = int(f.get("limit") or 20)
-        run.step("find", "running", f"Searching “{_query(f)}”")
-        if smart:
-            run.log(f"Searching Google Maps for “{_query(f)}”")
-            maps = gmaps.search(_query(f), limit)
-            places = [{**p, "sources": [{"label": "Google Maps", "url": p["maps_url"]}], "people": [], "founded_year": None}
-                      for p in maps]
-            counts = {"Google Maps": len(maps)}
+        left = [] if smart else (_db().table(store.COMPANIES).select("*").eq("agent_run_id", run.id)
+                                 .eq("status", "enriching").order("created_at").execute().data)
+        before = 0
+        if left:
+            # The server restarted while this run was reading websites: carry on with the ones still to read
+            saved, picked = left, []
+            before = int(run.counts.get("read") or 0)
+            run.log(f"Picking up where it stopped: {len(left)} websites still to read")
         else:
-            more = len(_queries(f, limit)) - 1
-            run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”"
-                    + (f" and {more} similar search{'es' if more > 1 else ''}" if more else ""))
-            places, counts = _find(f, limit, run)
-        if run.stopped():
-            return
-        skip = list(settings.get("skip_sites") or []) + list(ALWAYS_SKIP)
-        known, picked, by_domain = store.known_domains(uid), [], {}
-        for p in places:
-            d = website.clean_domain(p["website"])
-            if not d or not website.valid_domain(d) or website.skipped(d, skip) or "association" in (p["category"] or "").lower():
-                continue
-            if d in known:
-                continue
-            if d in by_domain:
-                _merge_into(by_domain[d], p)
-                continue
-            by_domain[d] = {**p, "domain": d}
-            picked.append(by_domain[d])
-        picked = picked[:limit]
-        found = ", ".join(f"{k} {n}" for k, n in counts.items())
-        run.log(f"Found on {found}: {len(picked)} are new and have a website", found=len(places), new=len(picked),
-                sources=counts)
-        run.step("find", "done", f"{found}: {len(picked)} new with a website")
-        if not picked:
-            for s in run.steps[1:]:
-                run.step(s["id"], "done", "Nothing new to do")
-            _save(run.id, {"status": "done", "finished_at": _now().isoformat()})
-            return
+            run.step("find", "running", f"Searching “{_query(f)}”")
+            if smart:
+                run.log(f"Searching Google Maps for “{_query(f)}”")
+                maps = gmaps.search(_query(f), limit)
+                places = [{**p, "sources": [{"label": "Google Maps", "url": p["maps_url"]}], "people": [], "founded_year": None}
+                          for p in maps]
+                counts = {"Google Maps": len(maps)}
+            else:
+                more = len(_queries(f, limit)) - 1
+                run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”"
+                        + (f" and {more} similar search{'es' if more > 1 else ''}" if more else ""))
+                places, counts = _find(f, limit, run)
+            if run.stopped():
+                return
+            skip = list(settings.get("skip_sites") or []) + list(ALWAYS_SKIP)
+            known, picked, by_domain = store.known_domains(uid), [], {}
+            for p in places:
+                d = website.clean_domain(p["website"])
+                if not d or not website.valid_domain(d) or website.skipped(d, skip) or "association" in (p["category"] or "").lower():
+                    continue
+                if d in known:
+                    continue
+                if d in by_domain:
+                    _merge_into(by_domain[d], p)
+                    continue
+                by_domain[d] = {**p, "domain": d}
+                picked.append(by_domain[d])
+            picked = picked[:limit]
+            found = ", ".join(f"{k} {n}" for k, n in counts.items())
+            run.log(f"Found on {found}: {len(picked)} are new and have a website", found=len(places), new=len(picked),
+                    sources=counts)
+            run.step("find", "done", f"{found}: {len(picked)} new with a website")
+            if not picked:
+                for s in run.steps[1:]:
+                    run.step(s["id"], "done", "Nothing new to do")
+                _save(run.id, {"status": "done", "finished_at": _now().isoformat()})
+                return
 
-        run.step("save", "running")
-        rows = []
-        for p in picked:
-            r = store.company_row(uid, {"name": p["name"], "website": p["domain"], "country": f["country"], "state": f.get("state"),
-                                        "city": f["city"], "company_type": f["company_type"]}, "search")
-            # With enrichment the company waits in the normal queue ("queued") and the lead finder loop runs its 8 steps
-            r.update(status="queued" if smart else "enriching", phone=p["phone"], address=p["address"], agent_run_id=run.id,
-                     rating=round(p["rating"], 1) if p["rating"] else None, reviews=p["reviews"],
-                     sources=[x for x in p["sources"] if x.get("url")])
-            rows.append(r)
-        saved = [x for i in range(0, len(rows), 200) for x in _db().table(store.COMPANIES).insert(rows[i:i + 200]).execute().data]
-        run.step("save", "done", f"{len(saved)} companies saved")
+            run.step("save", "running")
+            rows = []
+            for p in picked:
+                r = store.company_row(uid, {"name": p["name"], "website": p["domain"], "country": f["country"], "state": f.get("state"),
+                                            "city": f["city"], "company_type": f["company_type"]}, "search")
+                # With enrichment the company waits in the normal queue ("queued") and the lead finder loop runs its 8 steps
+                r.update(status="queued" if smart else "enriching", phone=p["phone"], address=p["address"], agent_run_id=run.id,
+                         rating=round(p["rating"], 1) if p["rating"] else None, reviews=p["reviews"],
+                         sources=[x for x in p["sources"] if x.get("url")])
+                rows.append(r)
+            saved = [x for i in range(0, len(rows), 200) for x in _db().table(store.COMPANIES).insert(rows[i:i + 200]).execute().data]
+            run.step("save", "done", f"{len(saved)} companies saved")
 
-        if smart:
-            run.log(f"{len(saved)} companies handed to enrichment: Hunter finds the owners, Reoon checks emails, the AI writes lines")
-            run.step("enrich", "running", f"0 of {len(saved)} done")
-            _save(run.id, {"status": "enriching"})
-            return
+            if smart:
+                run.log(f"{len(saved)} companies handed to enrichment: Hunter finds the owners, Reoon checks emails, the AI writes lines")
+                run.step("enrich", "running", f"0 of {len(saved)} done")
+                _save(run.id, {"status": "enriching"})
+                return
 
-        run.step("read", "running", f"0 of {len(saved)}")
+        total = before + len(saved)
+        run.step("read", "running", f"{before} of {total}")
         run.step("emails", "running")
-        with_email = 0
+        with_email = int(run.counts.get("emails") or 0) if before else 0
         extras = {p["domain"]: p for p in picked}
         with httpx.Client(follow_redirects=False) as client, Browser() as browser:
             for i, c in enumerate(saved, 1):
@@ -513,11 +523,11 @@ def _search(row: dict) -> None:
                     "phone": c.get("phone") or (site.phones[0] if site.phones else None),
                     "socials": site.socials, "founded_year": site.founded_year, "technologies": site.technologies,
                 })
-                run.count(read=i, emails=with_email, current=None)
-                run.step("read", "running", f"{i} of {len(saved)}")
+                run.count(read=before + i, emails=with_email, current=None)
+                run.step("read", "running", f"{before + i} of {total}")
                 run.step("emails", "running", f"{with_email} found so far")
-        run.step("read", "done", f"{len(saved)} websites read")
-        run.step("emails", "done", f"{with_email} of {len(saved)} companies have an email")
+        run.step("read", "done", f"{total} websites read")
+        run.step("emails", "done", f"{with_email} of {total} companies have an email")
         run.step("send", "running", "Starting")
         _save(run.id, {"status": "sending", "next_send_at": _now().isoformat()})
     except gmaps.MapsError as e:
@@ -686,12 +696,21 @@ def _send_one(run: dict) -> None:
 # ---------- The loop's tick ----------
 
 def recover() -> None:
-    """After a restart a search that was cut off starts again (companies already saved are skipped). A company left
-    half-read by a run without enrichment is marked ready as it is, so it never falls into the enrichment queue and
-    spends credits. (With enrichment, the lead finder loop recovers its own companies.)"""
+    """After a restart a search that was cut off starts again (companies already saved are skipped); one cut off while
+    reading websites carries on with the companies it hadn't read yet. Any other company left half-read by a run without
+    enrichment is marked ready as it is, so it never falls into the enrichment queue and spends credits. (With
+    enrichment, the lead finder loop recovers its own companies.)"""
+    resuming = set()
     for r in _db().table(RUNS).select("id,mode").eq("status", "running").execute().data:
-        _save(r["id"], {"status": "queued", "steps": new_steps(r.get("mode") or "fast"), "counts": {}})
-    fast = [r["id"] for r in _db().table(RUNS).select("id").eq("mode", "fast").order("created_at", desc=True).limit(50).execute().data]
+        left = (_db().table(store.COMPANIES).select("id").eq("agent_run_id", r["id"]).eq("status", "enriching").limit(1)
+                .execute().data) if r.get("mode") == "fast" else []
+        if left:  # cut off while reading websites: it carries on with the rest, keeping what it already did
+            resuming.add(r["id"])
+            _save(r["id"], {"status": "queued"})
+        else:
+            _save(r["id"], {"status": "queued", "steps": new_steps(r.get("mode") or "fast"), "counts": {}})
+    fast = [r["id"] for r in _db().table(RUNS).select("id").eq("mode", "fast").order("created_at", desc=True).limit(50).execute().data
+            if r["id"] not in resuming]
     if fast:
         (_db().table(store.COMPANIES).update({"status": "ready", "finished_at": store.now_iso()})
          .eq("status", "enriching").in_("agent_run_id", fast).execute())
