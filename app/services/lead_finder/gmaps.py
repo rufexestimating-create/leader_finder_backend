@@ -1,10 +1,12 @@
 """Companies from Google Maps through gosom/google-maps-scraper (MIT, self-hosted, no API key).
 
 The scraper runs as a one-off Docker container per search and exits when done, so its browser only uses memory while
-a search is running. Only one search runs at a time on the server.
+a search is running. Only one search runs at a time on the server. With `emails` it also opens each place's website and
+collects the emails on it (gosom's -email).
 """
 import csv
 import logging
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +19,9 @@ IMAGE = "gosom/google-maps-scraper"
 _lock = threading.Lock()
 
 
+_EMAIL = re.compile(r"[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}", re.I)
+
+
 class MapsError(Exception):
     pass
 
@@ -26,8 +31,8 @@ def _depth(limit: int) -> int:
     return 1 if limit <= 15 else 2 if limit <= 35 else 4
 
 
-def search(query: str, limit: int, timeout: int = 900) -> list[dict]:
-    """[{name, website, phone, address, rating, reviews, category, maps_url}] in Google's order"""
+def search(query: str, limit: int, timeout: int = 900, emails: bool = False) -> list[dict]:
+    """[{name, website, phone, address, rating, reviews, category, maps_url, emails}] in Google's order"""
     if not shutil.which("docker"):
         raise MapsError("Searching Google Maps needs Docker on the server, and it isn't installed.")
     with _lock, tempfile.TemporaryDirectory(prefix="gmaps-") as tmp:
@@ -35,7 +40,7 @@ def search(query: str, limit: int, timeout: int = 900) -> list[dict]:
         cmd = ["docker", "run", "--rm", "--memory=1200m", "--cpus=0.9", "-e", "DISABLE_TELEMETRY=1",
                "-v", "gmaps-playwright-cache:/opt", "-v", f"{tmp}:/data", IMAGE,
                "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(limit)),
-               "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"]
+               "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"] + (["-email"] if emails else [])
         try:
             done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -62,4 +67,5 @@ def search(query: str, limit: int, timeout: int = 900) -> list[dict]:
         "reviews": num(r.get("review_count"), int),
         "category": (r.get("category") or "").strip(),
         "maps_url": (r.get("link") or "").strip() or None,
+        "emails": list(dict.fromkeys(e.lower() for e in _EMAIL.findall(r.get("emails") or r.get("email") or ""))),
     } for r in rows if (r.get("title") or "").strip()]

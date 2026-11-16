@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     # Losing it makes the saved keys unreadable: users would add them again.
     KEYS_ENCRYPTION_KEY: str = ""
 
+    # FlareSolverr (self-hosted, opens pages behind "checking your browser" screens); empty switches it off
+    FLARESOLVERR_URL: str = "http://127.0.0.1:8191/v1"
+
     SUPABASE_URL: str = ""
     SUPABASE_SERVICE_ROLE_KEY: str = ""
 

@@ -1,9 +1,11 @@
 """ReachAgent's automatic runs. Both modes find companies the same way and send the same way; only the middle differs.
 
 Without enrichment ("fast": no API key, no paid tool)
-  1 find    Google Maps (gosom) for "<company type> in <city>": name, website, phone, address, rating
+  1 find    Google Maps (gosom, which also collects the emails on each website), the BBB directory (website, owner's name)
+            and OpenStreetMap, all at once for "<company type> in <city>"; merged, one company per website
   2 save    new companies only (a website already in ReachAgent is skipped)
-  3 read    each company's website: emails, phone, social links, the people it names
+  3 read    each company's website, up to 7 pages (team, about, contact), with a real browser for pages built by
+            JavaScript or behind a robot check: emails, phone, social links, the people it names
   4 emails  one address per company: a named person's email on the site, else a named person's email guessed and
             confirmed by the company's own mail server, else the company address (info@, office@)
   5 send    the agent message from Settings
@@ -32,7 +34,8 @@ from datetime import datetime, timedelta, timezone
 import httpx
 
 from app.db.supabase import get_supabase
-from app.services.lead_finder import gmaps, keys, mailbox, mailcheck, store, website
+from app.services.lead_finder import directories, gmaps, keys, mailbox, mailcheck, osm, store, website
+from app.services.lead_finder.browser import Browser
 from app.services.lead_finder.constants import ALWAYS_SKIP, STEP_IDS, is_us, type_label
 from app.services.lead_finder.providers import ProviderError, ReoonVerifier
 
@@ -40,7 +43,8 @@ log = logging.getLogger("uvicorn.error")
 
 RUNS = "prospect_agent_runs"
 STEPS = {
-    "fast": [("find", "Find companies on Google Maps"), ("save", "Save new companies"), ("read", "Read their websites"),
+    "fast": [("find", "Find companies (Google Maps, BBB, OpenStreetMap)"), ("save", "Save new companies"),
+             ("read", "Read their websites (team, about and contact pages)"),
              ("emails", "Find an email for each"), ("send", "Send the message")],
     "smart": [("find", "Find companies on Google Maps"), ("save", "Save new companies"),
               ("enrich", "Find the owners and their emails (Hunter), check them (Reoon), write personal lines (AI)"),
@@ -183,11 +187,12 @@ def _pick_contact(company: dict, domain: str, site: website.SiteData) -> tuple[d
     return None, note or "No email on the website"
 
 
-def _company_steps(domain: str, site: website.SiteData, contact: dict | None, how: str) -> list[dict]:
+def _company_steps(domain: str, site: website.SiteData, contact: dict | None, how: str, found_on: str = "Google Maps") -> list[dict]:
+    read = f"Read {len(site.pages)} page(s){' with a real browser' if site.via_browser else ''}"
     notes = {
-        "website": f"Found on Google Maps: {domain}",
+        "website": f"Found on {found_on}: {domain}",
         "cache": "Agent run without enrichment: nothing looked up in paid tools",
-        "read": f"Read {len(site.pages)} page(s)" if site.pages else f"Couldn't read the website ({site.error})",
+        "read": read if site.pages else f"Couldn't read the website ({site.error})",
         "extract": f"{len(site.emails)} email(s), {len(site.phones)} phone(s), {len(site.socials)} social link(s)",
         "people": ", ".join(f"{p['name']} ({p.get('title') or '?'})" for p in site.people[:3]) or "The website names no one",
         "emails": how,
@@ -277,36 +282,125 @@ def _bulk(row: dict) -> None:
         _save(run.id, {"status": "failed", "error": "Something went wrong while checking your list. Try again.", "finished_at": _now().isoformat()})
 
 
+def _place(f: dict) -> str:
+    return ", ".join(x for x in (f.get("city"), f.get("state"), f.get("country")) if x)
+
+
+def _find(f: dict, limit: int, run: "_Run") -> tuple[list[dict], dict[str, int]]:
+    """Every source at once: Google Maps on this thread, BBB and OpenStreetMap beside it. Each place comes back as
+    {name, website, phone, address, rating, reviews, category, sources, emails, people, founded_year}, plus how many
+    each source gave. Raises MapsError only when no source answered."""
+    extra: dict[str, list] = {"bbb": [], "osm": []}
+    failed: dict[str, str] = {}
+
+    def side():
+        if is_us(f.get("country")):
+            try:
+                extra["bbb"] = directories.bbb(f["company_type"], f.get("city") or "", f.get("state"), limit)
+            except directories.DirectoryError as e:
+                failed["BBB"] = str(e)
+            except Exception as e:
+                log.warning("bbb search failed: %s: %s", type(e).__name__, e)
+                failed["BBB"] = "BBB couldn't be searched"
+        try:
+            extra["osm"] = osm.search(f["company_type"], _place(f), limit * 2)
+        except Exception as e:
+            failed["OpenStreetMap"] = str(e) if isinstance(e, osm.OsmError) else "OpenStreetMap couldn't be searched"
+
+    helper = threading.Thread(target=side, name="agent-sources", daemon=True)
+    helper.start()
+    maps: list[dict] = []
+    try:
+        maps = gmaps.search(_query(f), limit, emails=True)
+    except gmaps.MapsError as e:
+        failed["Google Maps"] = str(e)
+    helper.join(timeout=900)
+
+    for name, why in failed.items():
+        run.log(f"{name}: {why}")
+    lists = [
+        [{**p, "sources": [{"label": "Google Maps", "url": p["maps_url"]}], "people": [], "founded_year": None} for p in maps],
+        [{"name": b["name"], "website": b["website"], "phone": b["phone"], "address": b["address"], "rating": None,
+          "reviews": None, "category": "", "sources": [{"label": "BBB", "url": b["bbb_url"]}], "emails": [],
+          "people": b["people"], "founded_year": b["founded_year"]} for b in extra["bbb"]],
+        [{"name": o["name"], "website": o["website"], "phone": o["phone"], "address": o["address"], "rating": None,
+          "reviews": None, "category": "", "sources": [{"label": "OpenStreetMap", "url": o["osm_url"]}],
+          "emails": [o["email"]] if o["email"] else [], "people": [], "founded_year": None} for o in extra["osm"]],
+    ]
+    counts = {"Google Maps": len(maps), "BBB": len(extra["bbb"]), "OpenStreetMap": len(extra["osm"])}
+    if "Google Maps" in failed and not any(lists[1:]):
+        raise gmaps.MapsError(failed["Google Maps"])
+    # Take turns between the sources so each of them adds companies, Google Maps first
+    longest = max(len(x) for x in lists)
+    merged = [x[i] for i in range(longest) for x in lists if i < len(x)]
+    return merged, counts
+
+
+def _merge_into(have: dict, p: dict) -> None:
+    """The same company found by another source: keep its links, emails and people too"""
+    have["sources"] += [x for x in p["sources"] if x["label"] not in {s["label"] for s in have["sources"]}]
+    have["emails"] += [e for e in p["emails"] if e not in have["emails"]]
+    have["people"] += [x for x in p["people"] if x["name"].lower() not in {y["name"].lower() for y in have["people"]}]
+    for k in ("phone", "address", "founded_year"):
+        have[k] = have.get(k) or p.get(k)
+
+
+def _with_extras(site: website.SiteData, domain: str, extra: dict) -> website.SiteData:
+    """Emails Google Maps collected and people BBB names, added to what the website itself says"""
+    for e in extra.get("emails") or []:
+        host = e.split("@")[-1]
+        if e not in site.emails and (website._same_site(host, domain) or host in mailcheck.FREE_MAIL):
+            site.emails.append(e)
+    known = {p["name"].lower() for p in site.people}
+    site.people += [p for p in extra.get("people") or [] if p["name"].lower() not in known]
+    site.founded_year = site.founded_year or extra.get("founded_year")
+    return site
+
+
 def _search(row: dict) -> None:
     if row.get("mode") == "bulk":
         return _bulk(row)
     run, f, uid = _Run(row), row["filters"], row["user_id"]
     try:
         settings = store.get_settings(uid)
+        smart = row.get("mode") == "smart"
+        limit = int(f.get("limit") or 20)
         run.step("find", "running", f"Searching “{_query(f)}”")
-        run.log(f"Searching Google Maps for “{_query(f)}”")
-        places = gmaps.search(_query(f), int(f.get("limit") or 20))
+        if smart:
+            run.log(f"Searching Google Maps for “{_query(f)}”")
+            maps = gmaps.search(_query(f), limit)
+            places = [{**p, "sources": [{"label": "Google Maps", "url": p["maps_url"]}], "people": [], "founded_year": None}
+                      for p in maps]
+            counts = {"Google Maps": len(maps)}
+        else:
+            run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”")
+            places, counts = _find(f, limit, run)
         if run.stopped():
             return
         skip = list(settings.get("skip_sites") or []) + list(ALWAYS_SKIP)
-        known, picked = store.known_domains(uid), []
+        known, picked, by_domain = store.known_domains(uid), [], {}
         for p in places:
             d = website.clean_domain(p["website"])
-            if not d or not website.valid_domain(d) or website.skipped(d, skip) or "association" in p["category"].lower():
+            if not d or not website.valid_domain(d) or website.skipped(d, skip) or "association" in (p["category"] or "").lower():
                 continue
-            if d in known or any(x["domain"] == d for x in picked):
+            if d in known:
                 continue
-            picked.append({**p, "domain": d})
-        picked = picked[: int(f.get("limit") or 20)]
-        run.log(f"Google Maps gave {len(places)} places: {len(picked)} are new and have a website", found=len(places), new=len(picked))
-        run.step("find", "done", f"{len(places)} on Google Maps, {len(picked)} new with a website")
+            if d in by_domain:
+                _merge_into(by_domain[d], p)
+                continue
+            by_domain[d] = {**p, "domain": d}
+            picked.append(by_domain[d])
+        picked = picked[:limit]
+        found = ", ".join(f"{k} {n}" for k, n in counts.items())
+        run.log(f"Found on {found}: {len(picked)} are new and have a website", found=len(places), new=len(picked),
+                sources=counts)
+        run.step("find", "done", f"{found}: {len(picked)} new with a website")
         if not picked:
             for s in run.steps[1:]:
                 run.step(s["id"], "done", "Nothing new to do")
             _save(run.id, {"status": "done", "finished_at": _now().isoformat()})
             return
 
-        smart = row.get("mode") == "smart"
         run.step("save", "running")
         rows = []
         for p in picked:
@@ -315,7 +409,7 @@ def _search(row: dict) -> None:
             # With enrichment the company waits in the normal queue ("queued") and the lead finder loop runs its 8 steps
             r.update(status="queued" if smart else "enriching", phone=p["phone"], address=p["address"], agent_run_id=run.id,
                      rating=round(p["rating"], 1) if p["rating"] else None, reviews=p["reviews"],
-                     sources=[{"label": "Google Maps", "url": p["maps_url"]}] if p["maps_url"] else [])
+                     sources=[x for x in p["sources"] if x.get("url")])
             rows.append(r)
         saved = _db().table(store.COMPANIES).insert(rows).execute().data
         run.step("save", "done", f"{len(saved)} companies saved")
@@ -329,16 +423,20 @@ def _search(row: dict) -> None:
         run.step("read", "running", f"0 of {len(saved)}")
         run.step("emails", "running")
         with_email = 0
-        with httpx.Client(follow_redirects=False) as client:
+        extras = {p["domain"]: p for p in picked}
+        with httpx.Client(follow_redirects=False) as client, Browser() as browser:
             for i, c in enumerate(saved, 1):
                 if run.stopped():
                     return
                 run.log(f"Reading {c['domain']} ({c['name']})", current=c["domain"])
-                site = website.read_site(client, c["domain"], c["name"], c["city"])
+                extra = extras.get(c["domain"]) or {}
+                site = _with_extras(website.read_site(client, c["domain"], c["name"], c["city"], browser=browser), c["domain"], extra)
                 if site.pages:
-                    run.log(f"{c['domain']}: read {', '.join(site.pages)}; {len(site.emails)} email(s), {len(site.people)} named person(s)")
+                    how_read = " with a real browser" if site.via_browser else ""
+                    run.log(f"{c['domain']}: read {', '.join(site.pages)}{how_read}; {len(site.emails)} email(s), {len(site.people)} named person(s)")
                 else:
-                    run.log(f"{c['domain']}: couldn't read the website ({site.error})")
+                    run.log(f"{c['domain']}: couldn't read the website ({site.error})"
+                            + (f"; {len(site.emails)} email(s), {len(site.people)} person(s) from the directories" if site.emails or site.people else ""))
                 contact, how = _pick_contact(c, c["domain"], site)
                 run.log(f"{c['domain']}: {contact['email'] + ' (' + how + ')' if contact else 'no email: ' + how}")
                 if contact:
@@ -346,7 +444,8 @@ def _search(row: dict) -> None:
                     store.replace_contacts(c, [{**contact, "linkedin": None, "personal_line": "", "selected": True}])
                 store.update_company(c["id"], {
                     "status": "ready", "finished_at": store.now_iso(), "error": None,
-                    "steps": _company_steps(c["domain"], site, contact, how),
+                    "steps": _company_steps(c["domain"], site, contact, how,
+                                            " and ".join(x["label"] for x in extra.get("sources") or []) or "Google Maps"),
                     "phone": c.get("phone") or (site.phones[0] if site.phones else None),
                     "socials": site.socials, "founded_year": site.founded_year, "technologies": site.technologies,
                 })

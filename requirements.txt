@@ -13,3 +13,4 @@ cryptography==50.0.2
 PyJWT==2.15.1
 tzdata==2026.5
 pytest>=8.3.0
+crawl4ai==0.9.5

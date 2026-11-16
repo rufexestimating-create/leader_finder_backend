@@ -5,8 +5,9 @@ Safe by design, because the address comes from a form:
   * only http(s) on the normal ports, and only hosts whose every address is on the public internet (never localhost,
     the server's own network or cloud metadata), checked again on every redirect
   * robots.txt is respected
-  * at most 5 pages per company, 1.5 MB and a few seconds each
-Uses only the standard library's HTML parser, so no extra package is needed.
+  * at most 7 pages per company, 1.5 MB and a few seconds each
+Uses the standard library's HTML parser. Pages that only a real browser can open (built by JavaScript, robot challenge
+screens, sites that turn away plain requests) are read through `browser.Browser` when one is passed in.
 """
 import ipaddress
 import json
@@ -25,7 +26,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; LeadFinder/1.0)"
 ROBOTS_AGENT = "LeadFinder"
 MAX_BYTES = 1_500_000
 MAX_REDIRECTS = 4
-MAX_EXTRA_PAGES = 4
+MAX_EXTRA_PAGES = 6
 PAGE_TIMEOUT = httpx.Timeout(12.0, connect=6.0)
 
 
@@ -270,6 +271,30 @@ def find_pages(home: Parsed, domain: str, limit: int = MAX_EXTRA_PAGES) -> list[
         seen.add(path)
         picks.append((score, len(picks), f"{parts.scheme}://{parts.netloc}{parts.path}"))
     return [url for _, _, url in sorted(picks)[:limit]]
+
+
+# Menus built by JavaScript hide their links: the usual addresses are tried directly, the first that opens per kind
+_GUESSES = (("contact", ("/contact-us", "/contact")), ("about", ("/about-us", "/about")), ("team", ("/our-team", "/team")))
+
+
+def guessed_pages(home_url: str, have: list[str]) -> list[tuple[str, tuple[str, ...]]]:
+    """[(kind, candidate urls)] for each kind of page the home page's links didn't lead to"""
+    origin = "{0.scheme}://{0.netloc}".format(urlsplit(home_url))
+    paths = " ".join(urlsplit(u).path.lower() for u in have)
+    return [(kind, tuple(origin + c for c in cands)) for kind, cands in _GUESSES if kind not in paths]
+
+
+_CHALLENGE = re.compile(r"just a moment|checking your browser|robot challenge|access denied|attention required|"
+                        r"security check|are you a robot|captcha|ddos protection|website security", re.I)
+_TITLE_TAG = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+
+
+def needs_browser(p: Parsed) -> bool:
+    """A challenge screen, or a page with next to no text: its content is built by JavaScript"""
+    title = _TITLE_TAG.search(p.html[:20_000])
+    if title and _CHALLENGE.search(title.group(1)):
+        return True
+    return len(" ".join(p.lines)) < 300 and len(p.links) < 5
 
 
 def page_name(url: str) -> str:
@@ -607,14 +632,26 @@ class SiteData:
     technologies: list[str] = field(default_factory=list)
     people: list[dict] = field(default_factory=list)
     excerpts: list[dict] = field(default_factory=list)  # [{page, text}]: sentences about what the company does
+    via_browser: bool = False  # some pages could only be opened by a real browser
     error: str | None = None
 
 
 _TRY_AGAIN = ("The website took too long to answer", "The website couldn't be opened", "This website's address doesn't exist")
 
 
-def read_site(client: httpx.Client, domain: str, company_name: str = "", city: str = "") -> SiteData:
-    """Home page plus up to 4 team / about / contact pages. Never raises: a site that can't be read sets `error`."""
+def _render(browser, url: str) -> Page | None:
+    """The page as a real browser sees it; the address is checked before and after, like `fetch` does"""
+    if browser is None or host_problem(urlsplit(url).hostname or ""):
+        return None
+    got = browser.render(url)
+    if not got or host_problem(urlsplit(got[0]).hostname or ""):
+        return None
+    return Page(*got)
+
+
+def read_site(client: httpx.Client, domain: str, company_name: str = "", city: str = "", browser=None) -> SiteData:
+    """Home page plus up to 6 team / about / contact pages. Never raises: a site that can't be read sets `error`.
+    With a `browser`, pages a plain request can't open are opened by a real browser."""
     data = SiteData()
     if not valid_domain(domain):
         data.error = "The website address isn't valid"
@@ -634,6 +671,10 @@ def read_site(client: httpx.Client, domain: str, company_name: str = "", city: s
             home = fetch(client, f"https://{domain}/")
         except FetchError as e:
             errors[0] = str(e)
+    if (home is None and errors and errors[0] != "This website's address doesn't exist") or (home and needs_browser(parse(home))):
+        shown = _render(browser, home.url if home else f"https://{domain}/")
+        if shown and not needs_browser(parse(shown)):
+            home, data.via_browser = shown, True
     if home is None:
         # The first try (the address as given) says what really went wrong; the www. and http:// fallbacks don't
         data.error = errors[0] if errors else "The website couldn't be opened"
@@ -645,18 +686,37 @@ def read_site(client: httpx.Client, domain: str, company_name: str = "", city: s
         data.error = "The website asks tools like this one not to read it"
         return data
 
-    parsed = [parse(home)]
-    names, urls = ["home"], [home.url]
-    for url in find_pages(parsed[0], domain):
+    def open_page(url: str) -> Page | None:
         if rules is not None and not rules.can_fetch(ROBOTS_AGENT, url):
-            continue
+            return None
         try:
             page = fetch(client, url)
-        except FetchError:
-            continue
-        parsed.append(parse(page))
-        names.append(page_name(url))
-        urls.append(page.url)
+            if not (data.via_browser and needs_browser(parse(page))):
+                return page
+        except FetchError as e:
+            if not data.via_browser or "error 404" in str(e) or "error 410" in str(e):
+                return None
+        return _render(browser, url)
+
+    parsed = [parse(home)]
+    names, urls = ["home"], [home.url]
+    found = find_pages(parsed[0], domain)
+    for url in found:
+        page = open_page(url)
+        if page:
+            parsed.append(parse(page))
+            names.append(page_name(url))
+            urls.append(page.url)
+    for _, candidates in guessed_pages(home.url, found):
+        if len(urls) > MAX_EXTRA_PAGES:
+            break
+        for url in candidates:
+            page = open_page(url)
+            if page and urlsplit(page.url).path.rstrip("/") not in {urlsplit(u).path.rstrip("/") for u in urls}:
+                parsed.append(parse(page))
+                names.append(page_name(url))
+                urls.append(page.url)
+                break
 
     data.pages, data.page_urls = names, urls
     data.emails = emails(parsed, domain)
