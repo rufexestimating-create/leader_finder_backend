@@ -644,7 +644,7 @@ def _send_one(run: dict) -> None:
                      else render(settings, company, contact))
     if test:
         note = f"TEST MODE: with test mode off, this email goes to {contact['name']} <{contact['email']}>.\n\n"
-        msg = mailbox.build(mb, mb["email"], mb.get("from_name") or "", f"[Test] {subject}", note + body)
+        msg = mailbox.build(mb, mailbox.test_address(mb), mb.get("from_name") or "", f"[Test] {subject}", note + body)
     else:
         to_name = contact["name"] if contact.get("title") != "Company email" and "@" not in (contact.get("name") or "") else ""
         msg = mailbox.build(mb, contact["email"], to_name, subject, body)

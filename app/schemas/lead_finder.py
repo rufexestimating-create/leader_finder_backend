@@ -82,7 +82,9 @@ class AgentRunIn(BaseModel):
 
 
 class MailboxModeIn(BaseModel):
-    test_mode: bool
+    test_mode: bool | None = None
+    # Where test emails go; "" goes back to the mailbox itself
+    test_to: str | None = Field(None, max_length=254, pattern=r"^$|^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 class RetryIn(BaseModel):

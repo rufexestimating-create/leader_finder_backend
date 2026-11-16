@@ -54,7 +54,7 @@ def send_company(company_id: str, user: dict = Depends(get_current_user)):
         for p in todo:
             subject, body = mailbox.render(s, company, p)
             note = f"TEST MODE: with test mode off, this email goes to {p['name']} <{p['email']}>.\n\n"
-            msgs.append(mailbox.build(mb, mb["email"], mb.get("from_name") or "", f"[Test] {subject}", note + body))
+            msgs.append(mailbox.build(mb, mailbox.test_address(mb), mb.get("from_name") or "", f"[Test] {subject}", note + body))
         try:
             errors = mailbox.send(mb, msgs, copy_to_sent=False)
         except mailbox.MailboxError as e:
@@ -245,11 +245,14 @@ def test_mailbox(user: dict = Depends(get_current_user)):
     return {"message": f"Test email sent to {mb['email']}. Check its inbox, and its Sent folder for the copy."}
 
 
-@router.patch("/mailbox", summary="Turn test mode on (every email goes to the mailbox itself) or off")
+@router.patch("/mailbox", summary="Turn test mode on or off, or choose the inbox test emails go to")
 def set_mailbox_mode(data: MailboxModeIn, user: dict = Depends(get_current_user)):
     _mailbox(user)
     try:
-        mailbox.set_test_mode(user["id"], data.test_mode)
+        if data.test_mode is not None:
+            mailbox.set_test_mode(user["id"], data.test_mode)
+        if data.test_to is not None:
+            mailbox.set_test_to(user["id"], data.test_to.strip().lower())
         return mailbox.status(user["id"])
     except keys.KeysUnavailable as e:
         raise _unavailable(e)

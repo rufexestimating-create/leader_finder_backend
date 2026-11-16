@@ -39,6 +39,7 @@ US_STATES = {
     "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
     "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
 }
+MAX_BLOCKED = 3  # profiles in a row BBB wouldn't open: it is blocking this server for now, so stop asking
 BUDGET_SECONDS = 15 * 60  # BBB pages behind a challenge take ~1 minute each: stop looking after this long
 _STATE = re.compile(r"window\.__PRELOADED_STATE__\s*=\s*(\{.*?\});?\s*</script>", re.S)
 _LD = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
@@ -60,9 +61,11 @@ def _open(client: httpx.Client, url: str) -> str | None:
     return got[1] if got else None
 
 
-def _profile(client: httpx.Client, url: str) -> dict:
-    """{website, people, founded_year} from a BBB profile page"""
-    html = _open(client, url) or ""
+def _profile(client: httpx.Client, url: str) -> dict | None:
+    """{website, people, founded_year} from a BBB profile page, or None when the page couldn't be opened"""
+    html = _open(client, url)
+    if html is None:
+        return None
     out = {"website": "", "people": [], "founded_year": None}
     m = _VISIT.search(html)
     if m:
@@ -96,6 +99,7 @@ def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip
     place = f"{city.strip().title()}, {abbr}" if abbr else city
     deadline = time.monotonic() + BUDGET_SECONDS
     out: list[dict] = []
+    blocked = 0
     with httpx.Client(headers=HEADERS, timeout=httpx.Timeout(25.0, connect=8.0), follow_redirects=True) as client:
         for page in range(1, min(MAX_PAGES, -(-limit // PER_PAGE) + 2) + 1):
             url = f"{BBB}/search?find_country=USA&find_text={quote_plus(text)}&find_loc={quote_plus(place)}&page={page}"
@@ -121,6 +125,13 @@ def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip
                 time.sleep(PAUSE)
                 profile_url = urljoin(BBB, r["reportUrl"])
                 prof = _profile(client, profile_url)
+                if prof is None:
+                    blocked += 1
+                    if blocked >= MAX_BLOCKED:
+                        log.info("bbb: %d profiles in a row blocked, stopping", blocked)
+                        return out
+                    continue
+                blocked = 0
                 if not prof["website"]:
                     continue
                 address = ", ".join(x for x in (r.get("address"), r.get("city"), r.get("state")) if x)

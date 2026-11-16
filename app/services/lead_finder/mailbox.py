@@ -46,12 +46,25 @@ def status(user_id: str) -> dict:
         return {"connected": False}
     return {"connected": True, "email": r["email"], "from_name": r.get("from_name") or "", "smtp_host": r["smtp_host"],
             "smtp_port": r["smtp_port"], "imap_host": r.get("imap_host") or "", "imap_port": r.get("imap_port") or 993,
-            "test_mode": is_test(r)}
+            "test_mode": is_test(r), "test_to": test_address(r)}
 
 
 def is_test(r: dict) -> bool:
     """Only an explicit off sends to real people; a missing value (column not added yet) stays safe"""
     return r.get("test_mode") is not False
+
+
+def test_address(r: dict) -> str:
+    """Where test mode sends every email: the inbox chosen in Settings, else the mailbox itself"""
+    return (r.get("test_to") or "").strip() or r["email"]
+
+
+def set_test_to(user_id: str, address: str) -> None:
+    try:
+        get_supabase().table(TABLE).update({"test_to": address or None}).eq("user_id", user_id).execute()
+    except Exception as e:
+        log.warning("test inbox could not be saved: %s", type(e).__name__)
+        raise keys.KeysUnavailable("The test inbox couldn't be saved: run backend/migrations/006_mailbox_test_inbox.sql in Supabase.")
 
 
 def set_test_mode(user_id: str, on: bool) -> None:
