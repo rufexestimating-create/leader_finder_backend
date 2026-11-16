@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger("uvicorn.error")
@@ -31,7 +32,16 @@ def _depth(wanted: int) -> int:
     return 1 if wanted <= 15 else 2 if wanted <= 35 else 4 if wanted <= 60 else 8 if wanted <= 100 else 12
 
 
-def search(query: str | list[str], limit: int, timeout: int | None = None, emails: bool = False) -> list[dict]:
+def _rows(path: Path) -> int:
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            return max(0, sum(1 for _ in fh) - 1)
+    except OSError:
+        return 0
+
+
+def search(query: str | list[str], limit: int, timeout: int | None = None, emails: bool = False,
+           progress=lambda places: None) -> list[dict]:
     """[{name, website, phone, address, rating, reviews, category, maps_url, emails}] in Google's order. Several
     queries ("general contractor in X", "construction company in X") reach past the ~120 places one search shows."""
     queries = [query] if isinstance(query, str) else query
@@ -45,13 +55,21 @@ def search(query: str | list[str], limit: int, timeout: int | None = None, email
                "-v", "gmaps-playwright-cache:/opt", "-v", f"{tmp}:/data", IMAGE,
                "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(per_query)),
                "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"] + (["-email"] if emails else [])
-        try:
-            done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
-        except subprocess.TimeoutExpired:
-            raise MapsError("Google Maps took too long to answer. Try again in a few minutes.")
         out = Path(tmp, "results.csv")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        started, told = time.monotonic(), -1
+        while proc.poll() is None:  # results.csv grows as places are read: say how far it got
+            if time.monotonic() - started > timeout:
+                proc.kill()
+                raise MapsError("Google Maps took too long to answer. Try again in a few minutes.")
+            n = _rows(out)
+            if n != told:
+                progress(n)
+                told = n
+            time.sleep(10)
+        err = proc.stderr.read() if proc.stderr else ""
         if not out.exists():
-            log.warning("gmaps scraper exited %s: %s", done.returncode, (done.stderr or done.stdout)[-400:])
+            log.warning("gmaps scraper exited %s: %s", proc.returncode, err[-400:])
             raise MapsError("Google Maps couldn't be searched right now. Try again in a few minutes.")
         with out.open(newline="", encoding="utf-8") as fh:
             rows = list(csv.DictReader(fh))

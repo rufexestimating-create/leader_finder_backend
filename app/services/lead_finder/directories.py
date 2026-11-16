@@ -28,6 +28,18 @@ _BBB_TEXT = {"gc": "general contractor", "sub": "contractor", "design_build": "d
              "developer": "real estate developer", "home_builder": "home builder", "remodeler": "remodeling",
              "architect": "architect", "engineer": "engineering", "interior": "interior designer",
              "supplier": "building supplies"}
+US_STATES = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR", "california": "CA", "colorado": "CO",
+    "connecticut": "CT", "delaware": "DE", "district of columbia": "DC", "florida": "FL", "georgia": "GA", "hawaii": "HI",
+    "idaho": "ID", "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC", "south dakota": "SD",
+    "tennessee": "TN", "texas": "TX", "utah": "UT", "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+}
+BUDGET_SECONDS = 15 * 60  # BBB pages behind a challenge take ~1 minute each: stop looking after this long
 _STATE = re.compile(r"window\.__PRELOADED_STATE__\s*=\s*(\{.*?\});?\s*</script>", re.S)
 _LD = re.compile(r'<script type="application/ld\+json">(.*?)</script>', re.S)
 _VISIT = re.compile(r'<a href="(https?://[^"]+)"[^>]*>(?:(?!</a>).){0,3000}?Visit Website</a>', re.S)
@@ -72,13 +84,17 @@ def _profile(client: httpx.Client, url: str) -> dict:
     return out
 
 
-def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip=lambda name, phone: False) -> list[dict]:
-    """[{name, website, phone, address, rating, people, founded_year, bbb_url}] for companies with a website.
-    `skip(name, phone)` leaves out companies already found elsewhere before their profile is opened."""
+def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip=lambda name, phone: False,
+        progress=lambda found: None, stop=lambda: False) -> list[dict]:
+    """[{name, website, phone, address, rating, people, founded_year, bbb_url}] for companies with a website, in the
+    city's own state only (BBB also lists far-away companies that serve the area). `skip(name, phone)` leaves out
+    companies already found elsewhere before their profile is opened; `progress(found)` is told after each one."""
     text = _BBB_TEXT.get(company_type or "")
     if not text or not city:
         return []
-    place = f"{city}, {state}" if state else city
+    abbr = US_STATES.get((state or "").strip().lower(), (state or "").strip().upper()[:2])
+    place = f"{city.strip().title()}, {abbr}" if abbr else city
+    deadline = time.monotonic() + BUDGET_SECONDS
     out: list[dict] = []
     with httpx.Client(headers=HEADERS, timeout=httpx.Timeout(25.0, connect=8.0), follow_redirects=True) as client:
         for page in range(1, min(MAX_PAGES, -(-limit // PER_PAGE) + 2) + 1):
@@ -98,6 +114,10 @@ def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip
                 phone = phones[0] if phones else None
                 if not name or not r.get("reportUrl") or r.get("outOfBusinessStatus") or skip(name, phone):
                     continue
+                if abbr and (r.get("state") or "").upper() != abbr:
+                    continue
+                if time.monotonic() > deadline or stop():
+                    return out
                 time.sleep(PAUSE)
                 profile_url = urljoin(BBB, r["reportUrl"])
                 prof = _profile(client, profile_url)
@@ -107,6 +127,7 @@ def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip
                 out.append({"name": name, "website": prof["website"], "phone": phone, "address": address or None,
                             "rating": r.get("rating"), "people": prof["people"], "founded_year": prof["founded_year"],
                             "bbb_url": profile_url})
+                progress(len(out))
                 if len(out) >= limit:
                     return out
             if len(results) < PER_PAGE:

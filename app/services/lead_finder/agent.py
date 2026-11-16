@@ -320,30 +320,60 @@ def _find(f: dict, limit: int, run: "_Run") -> tuple[list[dict], dict[str, int]]
     each source gave. Raises MapsError only when no source answered."""
     extra: dict[str, list] = {"bbb": [], "osm": []}
     failed: dict[str, str] = {}
+    lock = threading.Lock()
+    so_far = {"Google Maps": 0, "BBB": 0, "OpenStreetMap": 0}
+    gosom_done = threading.Event()
+
+    def tell(source: str, n: int):
+        with lock:
+            if so_far[source] == n:
+                return
+            so_far[source] = n
+            note = ", ".join(f"{k} {v}" for k, v in so_far.items())
+            run.step("find", "running", f"So far: {note}")
+            run.count(found=sum(so_far.values()))
 
     def side():
+        try:
+            osm_found = osm.search(f["company_type"], _place(f), limit * 2)
+            extra["osm"] = osm_found
+            tell("OpenStreetMap", len(osm_found))
+            with lock:
+                run.log(f"OpenStreetMap: {len(osm_found)} companies with a website")
+        except Exception as e:
+            failed["OpenStreetMap"] = str(e) if isinstance(e, osm.OsmError) else "OpenStreetMap couldn't be searched"
         if is_us(f.get("country")):
             try:
-                extra["bbb"] = directories.bbb(f["company_type"], f.get("city") or "", f.get("state"), limit)
+                # Stops once Google Maps is done and a few minutes have passed, so BBB never holds the run up for long
+                extra["bbb"] = directories.bbb(f["company_type"], f.get("city") or "", f.get("state"), limit,
+                                               progress=lambda n: tell("BBB", n), stop=lambda: gosom_done.wait(0) and over())
             except directories.DirectoryError as e:
                 failed["BBB"] = str(e)
             except Exception as e:
                 log.warning("bbb search failed: %s: %s", type(e).__name__, e)
                 failed["BBB"] = "BBB couldn't be searched"
-        try:
-            extra["osm"] = osm.search(f["company_type"], _place(f), limit * 2)
-        except Exception as e:
-            failed["OpenStreetMap"] = str(e) if isinstance(e, osm.OsmError) else "OpenStreetMap couldn't be searched"
+
+    grace = {"until": None}
+
+    def over() -> bool:
+        if grace["until"] is None:
+            grace["until"] = datetime.now(timezone.utc) + timedelta(minutes=3)
+        return datetime.now(timezone.utc) > grace["until"]
 
     helper = threading.Thread(target=side, name="agent-sources", daemon=True)
     helper.start()
     maps: list[dict] = []
     try:
-        # gosom's own email pass doubles a big search's time; the website reader finds those emails anyway
-        maps = gmaps.search(_queries(f, limit), limit, emails=limit <= 100)
+        # gosom's own email pass doubles the search's time on a small server; the website reader finds those emails anyway
+        maps = gmaps.search(_queries(f, limit), limit, emails=limit <= 20, progress=lambda n: tell("Google Maps", n))
+        with lock:
+            run.log(f"Google Maps: {len(maps)} places")
     except gmaps.MapsError as e:
         failed["Google Maps"] = str(e)
+    gosom_done.set()
     helper.join(timeout=900)
+    if extra["bbb"]:
+        run.log(f"BBB: {len(extra['bbb'])} companies with a website and their owners")
 
     for name, why in failed.items():
         run.log(f"{name}: {why}")
