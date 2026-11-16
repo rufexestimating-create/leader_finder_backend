@@ -143,9 +143,37 @@ class _Run:
 
 # ---------- Steps 1-4: find, save, read, emails ----------
 
-def _query(f: dict) -> str:
+def _query(f: dict, word: str | None = None) -> str:
     place = ", ".join(x for x in (f.get("city"), f.get("state"), None if is_us(f.get("country")) else f.get("country")) if x)
-    return f"{type_label(f['company_type']).lower()} in {place}"
+    return f"{word or type_label(f['company_type']).lower()} in {place}"
+
+
+# Other words people use for the same kind of company: each one is a separate Google Maps search (about 120 places each)
+_MORE_WORDS = {
+    "gc": ["construction company", "building contractor", "commercial contractor", "residential contractor", "construction services",
+           "renovation contractor", "builders", "construction management company"],
+    "sub": ["electrical contractor", "plumbing contractor", "hvac contractor", "roofing contractor", "concrete contractor",
+            "drywall contractor", "painting contractor", "flooring contractor"],
+    "design_build": ["design build contractor", "design and build company", "architecture and construction", "custom home design build"],
+    "cm": ["construction management company", "construction project management", "owner's representative construction",
+           "general contractor"],
+    "developer": ["real estate developer", "property developer", "commercial real estate developer", "residential developer",
+                  "real estate development company"],
+    "home_builder": ["custom home builder", "new home builder", "residential builder", "luxury home builder", "home construction company"],
+    "remodeler": ["remodeling contractor", "kitchen remodeling", "bathroom remodeling", "home renovation", "basement finishing",
+                  "home improvement contractor", "general contractor"],
+    "architect": ["architecture firm", "residential architect", "commercial architect", "architectural design"],
+    "engineer": ["structural engineer", "civil engineering firm", "mep engineering firm", "engineering consultant"],
+    "interior": ["interior design firm", "interior decorator", "commercial interior design", "residential interior design"],
+    "supplier": ["building materials supplier", "lumber yard", "construction supply", "tile supplier", "plumbing supply",
+                 "electrical supply"],
+}
+
+
+def _queries(f: dict, limit: int) -> list[str]:
+    """One Google Maps search per ~100 companies wanted, each with a different word for the same kind of company"""
+    words = [None, *_MORE_WORDS.get(f.get("company_type") or "", [])]
+    return [_query(f, w) for w in words[: max(1, -(-limit // 100))]]
 
 
 def _lead_first(people: list[dict]) -> list[dict]:
@@ -311,7 +339,8 @@ def _find(f: dict, limit: int, run: "_Run") -> tuple[list[dict], dict[str, int]]
     helper.start()
     maps: list[dict] = []
     try:
-        maps = gmaps.search(_query(f), limit, emails=True)
+        # gosom's own email pass doubles a big search's time; the website reader finds those emails anyway
+        maps = gmaps.search(_queries(f, limit), limit, emails=limit <= 100)
     except gmaps.MapsError as e:
         failed["Google Maps"] = str(e)
     helper.join(timeout=900)
@@ -373,7 +402,9 @@ def _search(row: dict) -> None:
                       for p in maps]
             counts = {"Google Maps": len(maps)}
         else:
-            run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”")
+            more = len(_queries(f, limit)) - 1
+            run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”"
+                    + (f" and {more} similar search{'es' if more > 1 else ''}" if more else ""))
             places, counts = _find(f, limit, run)
         if run.stopped():
             return
@@ -411,7 +442,7 @@ def _search(row: dict) -> None:
                      rating=round(p["rating"], 1) if p["rating"] else None, reviews=p["reviews"],
                      sources=[x for x in p["sources"] if x.get("url")])
             rows.append(r)
-        saved = _db().table(store.COMPANIES).insert(rows).execute().data
+        saved = [x for i in range(0, len(rows), 200) for x in _db().table(store.COMPANIES).insert(rows[i:i + 200]).execute().data]
         run.step("save", "done", f"{len(saved)} companies saved")
 
         if smart:

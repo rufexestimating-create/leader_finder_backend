@@ -53,7 +53,7 @@ class AgentRunIn(BaseModel):
     state: str = Field("", max_length=60)
     city: str = Field("", max_length=80)
     company_type: str = ""
-    limit: int = Field(20, ge=5, le=50)
+    limit: int = Field(20, ge=5, le=1000)
     recipients: list[RecipientIn] = Field(default_factory=list, max_length=1000)
     subject: str = Field("", max_length=200)
     message: str = Field("", max_length=5000)
@@ -73,6 +73,8 @@ class AgentRunIn(BaseModel):
         else:
             if len(self.country) < 2 or len(self.city) < 2:
                 raise ValueError("pick a country and a city")
+            if self.mode == "smart" and self.limit > 50:
+                raise ValueError("with enrichment looks into up to 50 companies at a time, as each one spends credits")
             if self.company_type not in COMPANY_TYPES:
                 raise ValueError("unknown company type")
             self.recipients = []

@@ -26,20 +26,24 @@ class MapsError(Exception):
     pass
 
 
-def _depth(limit: int) -> int:
-    # Each scroll of the results list loads roughly 10-20 more places
-    return 1 if limit <= 15 else 2 if limit <= 35 else 4
+def _depth(wanted: int) -> int:
+    # Each scroll of the results list loads roughly 10-20 more places; Google stops at about 120 per search
+    return 1 if wanted <= 15 else 2 if wanted <= 35 else 4 if wanted <= 60 else 8 if wanted <= 100 else 12
 
 
-def search(query: str, limit: int, timeout: int = 900, emails: bool = False) -> list[dict]:
-    """[{name, website, phone, address, rating, reviews, category, maps_url, emails}] in Google's order"""
+def search(query: str | list[str], limit: int, timeout: int | None = None, emails: bool = False) -> list[dict]:
+    """[{name, website, phone, address, rating, reviews, category, maps_url, emails}] in Google's order. Several
+    queries ("general contractor in X", "construction company in X") reach past the ~120 places one search shows."""
+    queries = [query] if isinstance(query, str) else query
+    per_query = -(-limit * 3 // 2 // len(queries))  # some places have no website or are already in ReachAgent
+    timeout = timeout or 900 + 300 * len(queries) + (4 * limit if emails else 0)
     if not shutil.which("docker"):
         raise MapsError("Searching Google Maps needs Docker on the server, and it isn't installed.")
     with _lock, tempfile.TemporaryDirectory(prefix="gmaps-") as tmp:
-        Path(tmp, "queries.txt").write_text(query.strip() + "\n", encoding="utf-8")
+        Path(tmp, "queries.txt").write_text("".join(q.strip() + "\n" for q in queries), encoding="utf-8")
         cmd = ["docker", "run", "--rm", "--memory=1200m", "--cpus=0.9", "-e", "DISABLE_TELEMETRY=1",
                "-v", "gmaps-playwright-cache:/opt", "-v", f"{tmp}:/data", IMAGE,
-               "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(limit)),
+               "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(per_query)),
                "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"] + (["-email"] if emails else [])
         try:
             done = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)

@@ -18,7 +18,7 @@ log = logging.getLogger("uvicorn.error")
 
 BBB = "https://www.bbb.org"
 PER_PAGE = 15
-MAX_PAGES = 4
+MAX_PAGES = 70
 PAUSE = 1.0
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
                          "Chrome/130.0 Safari/537.36", "Accept": "text/html,application/xhtml+xml", "Accept-Language": "en-US,en"}
@@ -81,7 +81,7 @@ def bbb(company_type: str | None, city: str, state: str | None, limit: int, skip
     place = f"{city}, {state}" if state else city
     out: list[dict] = []
     with httpx.Client(headers=HEADERS, timeout=httpx.Timeout(25.0, connect=8.0), follow_redirects=True) as client:
-        for page in range(1, MAX_PAGES + 1):
+        for page in range(1, min(MAX_PAGES, -(-limit // PER_PAGE) + 2) + 1):
             url = f"{BBB}/search?find_country=USA&find_text={quote_plus(text)}&find_loc={quote_plus(place)}&page={page}"
             html = _open(client, url)
             if html is None:
