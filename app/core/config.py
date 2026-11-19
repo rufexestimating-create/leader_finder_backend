@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     RESET_PASSWORD_TOKEN_EXPIRE_MINUTES: int = 60
 
     RUN_LEAD_FINDER: bool = True
+    # Agent runs that find companies at the same time. Each Google Maps search is a ~1.2 GB browser container,
+    # so 1 suits a 4 GB server; 3-4 needs about 8 GB and 4 CPUs.
+    MAX_PARALLEL_SCANS: int = 1
+    MAX_ACTIVE_AGENTS: int = 10
     # Secret that encrypts every user's own tool keys (Hunter, Serper, Reoon, AI) in the database.
     # Create one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     # Losing it makes the saved keys unreadable: users would add them again.

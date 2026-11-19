@@ -1,7 +1,7 @@
 """Companies from Google Maps through gosom/google-maps-scraper (MIT, self-hosted, no API key).
 
 The scraper runs as a one-off Docker container per search and exits when done, so its browser only uses memory while
-a search is running. Only one search runs at a time on the server. With `emails` it also opens each place's website and
+a search is running. Up to MAX_PARALLEL_SCANS searches run at a time on the server. With `emails` it also opens each place's website and
 collects the emails on it (gosom's -email).
 """
 import csv
@@ -14,10 +14,12 @@ import threading
 import time
 from pathlib import Path
 
+from app.core.config import settings
+
 log = logging.getLogger("uvicorn.error")
 
 IMAGE = "gosom/google-maps-scraper"
-_lock = threading.Lock()
+_lock = threading.BoundedSemaphore(max(1, settings.MAX_PARALLEL_SCANS))
 
 
 _EMAIL = re.compile(r"[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[a-z]{2,24}", re.I)

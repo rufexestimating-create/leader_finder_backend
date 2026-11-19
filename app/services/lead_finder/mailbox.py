@@ -267,7 +267,7 @@ def send(mb: dict, msgs: list[EmailMessage], copy_to_sent: bool = True) -> list[
     except (OSError, smtplib.SMTPException):
         raise MailboxError(f"Couldn't connect to your mailbox's server {mb['smtp_host']}. Try again in a moment.")
     errors: list[str | None] = []
-    with conn:
+    try:
         for msg in msgs:
             try:
                 conn.send_message(msg)
@@ -278,6 +278,13 @@ def send(mb: dict, msgs: list[EmailMessage], copy_to_sent: bool = True) -> list[
                 break
             except smtplib.SMTPException as e:
                 errors.append(_reason(e))
+    finally:
+        # Not `with conn:`: Elastic Email answers QUIT with 250, which smtplib's __exit__ raises as an error
+        try:
+            conn.quit()
+        except Exception:
+            pass
+        conn.close()
     sent = [m for m, err in zip(msgs, errors) if err is None]
     if sent and copy_to_sent and mb.get("imap_host"):
         _copy_to_sent(mb, sent)

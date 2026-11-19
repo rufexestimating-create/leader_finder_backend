@@ -8,7 +8,7 @@ Without enrichment ("fast": no API key, no paid tool)
             JavaScript or behind a robot check: emails, phone, social links, the people it names
   4 emails  one address per company: a named person's email on the site, else a named person's email guessed and
             confirmed by the company's own mail server, else the company address (info@, office@)
-  5 send    the agent message from Settings
+  5 send    the message written for this run, else the agent message from Settings
 
 With enrichment ("smart": the user's own tool keys)
   1 find, 2 save as above, then
@@ -22,8 +22,9 @@ Bulk send (the user's own list and message)
   2 save    the list, one company per domain, so it shows in Results
   3 send    the user's message, {{greeting}} being "Hi John," when the list gives a name, else "Hi there,"
 
-Finding runs on its own thread, one run at a time on the server. Sending is one email per tick, with a gap, within the
-daily limit and test mode, so a run can be stopped at any moment and carries on after a restart or the next day.
+Each run finds companies on its own thread, up to MAX_PARALLEL_SCANS runs at a time; the rest wait in the queue.
+Sending is one email per tick, with a gap, within the daily limit and test mode, so a run can be stopped at any moment
+and carries on after a restart or the next day. The gap is kept per mailbox, so several runs never send faster than one.
 """
 import logging
 import random
@@ -34,8 +35,10 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 
+from app.core.config import settings as config
 from app.db.supabase import get_supabase
-from app.services.lead_finder import directories, gmaps, keys, mailbox, mailcheck, osm, store, website
+from app.services.lead_finder import directories, gmaps, keys, listings, mailbox, mailcheck, osm, store, website
+from app.services.lead_finder.listings.profile import state_name
 from app.services.lead_finder.browser import Browser
 from app.services.lead_finder.constants import ALWAYS_SKIP, STEP_IDS, is_us, type_label
 from app.services.lead_finder.providers import ProviderError, ReoonVerifier
@@ -59,7 +62,13 @@ BOUNCE_LIMIT = 3
 EMAIL_CHECK_SECONDS = 60  # per company, for confirming guessed emails with its mail server
 _LEAD = ("owner", "founder", "president", "ceo", "principal", "partner", "managing")
 
-_thread: threading.Thread | None = None
+ACTIVE = ["queued", "running", "enriching", "sending", "waiting"]
+
+_threads: list[threading.Thread] = []
+# Two runs saving at the same moment could both pick a company neither had saved yet
+_save_lock = threading.Lock()
+# When each user's mailbox may send its next email, whichever run it belongs to
+_next_send: dict[str, datetime] = {}
 
 
 def _db():
@@ -72,19 +81,34 @@ def _now() -> datetime:
 
 # ---------- Runs ----------
 
-def new_steps(mode: str = "fast") -> list[dict]:
-    return [{"id": i, "label": label, "state": "pending", "note": ""} for i, label in STEPS.get(mode, STEPS["fast"])]
+DIRECTORY_FIND = "Find companies in your directory (its list pages and company pages)"
+
+
+def new_steps(mode: str = "fast", source: str | None = None) -> list[dict]:
+    return [{"id": i, "label": DIRECTORY_FIND if i == "find" and source == "directory" else label, "state": "pending", "note": ""}
+            for i, label in STEPS.get(mode, STEPS["fast"])]
 
 
 def start(user_id: str, filters: dict) -> dict:
     mode = filters.get("mode", "fast")
     row = {"user_id": user_id, "mode": mode, "filters": filters, "status": "queued",
-           "steps": new_steps(mode), "counts": {}, "processed": []}
+           "steps": new_steps(mode, filters.get("source")), "counts": {}, "processed": []}
     return _db().table(RUNS).insert(row).execute().data[0]
 
 
 def list_runs(user_id: str, limit: int = 10) -> list[dict]:
     return (_db().table(RUNS).select("*").eq("user_id", user_id).order("created_at", desc=True).limit(limit).execute().data)
+
+
+def active_count(user_id: str) -> int:
+    res = _db().table(RUNS).select("id", count="exact").eq("user_id", user_id).in_("status", ACTIVE).execute()
+    return res.count or 0
+
+
+def queue_position(run_id: str) -> int:
+    """1 when this queued run is next to start finding companies"""
+    queued = _db().table(RUNS).select("id").eq("status", "queued").order("created_at").execute().data
+    return next((i for i, r in enumerate(queued, 1) if r["id"] == run_id), 0)
 
 
 def get(user_id: str, run_id: str) -> dict | None:
@@ -98,7 +122,7 @@ def get(user_id: str, run_id: str) -> dict | None:
 
 def stop(user_id: str, run_id: str) -> dict | None:
     rows = (_db().table(RUNS).update({"status": "stopped", "finished_at": _now().isoformat(), "updated_at": _now().isoformat()})
-            .eq("user_id", user_id).eq("id", run_id).in_("status", ["queued", "running", "enriching", "sending", "waiting"]).execute().data)
+            .eq("user_id", user_id).eq("id", run_id).in_("status", ACTIVE).execute().data)
     if rows and rows[0].get("mode") == "smart":
         # Companies still waiting for enrichment don't spend credits after a stop
         (_db().table(store.COMPANIES).update({"status": "failed", "error": "The agent run was stopped before this company was looked into.",
@@ -419,6 +443,26 @@ def _with_extras(site: website.SiteData, domain: str, extra: dict) -> website.Si
     return site
 
 
+def _from_directory(f: dict, limit: int, uid: str, skip: list[str], run: "_Run") -> tuple[list[dict], dict]:
+    """The directory the user pasted, in the same shape as the Google Maps places. Companies already saved, or on the
+    skip list, don't count toward the limit, so the directory is walked until there are `limit` new ones."""
+    url, name = f["directory_url"], listings.site(f["directory_url"])
+    run.step("find", "running", f"Opening {name}")
+    run.log(f"Reading the directory {url}")
+    known = store.known_domains(uid)
+    found, stats = listings.collect(
+        url, limit, skip=lambda d: d in known or website.skipped(d, skip),
+        progress=lambda pages, n: (run.step("find", "running", f"{pages} page{'s' if pages > 1 else ''} read, {n} new with a website"),
+                                   run.count(found=n)),
+        note=lambda text: run.log(f"{name}: {text}"), stop=run.stopped)
+    run.log(f"{name}: {stats['pages']} page(s) read, {stats['profiles']} company pages opened")
+    places = [{"name": c["name"], "website": c["domain"], "phone": c["phone"] or None, "address": c["address"] or None,
+               "rating": None, "reviews": None, "category": "", "emails": c["emails"], "people": [], "founded_year": None,
+               "sources": [{"label": name, "url": c["url"]}], "city": c["city"], "state": state_name(c["state"]) or None}
+              for c in found]
+    return places, {name: stats["listed"]}
+
+
 def _search(row: dict) -> None:
     if row.get("mode") == "bulk":
         return _bulk(row)
@@ -436,21 +480,24 @@ def _search(row: dict) -> None:
             before = int(run.counts.get("read") or 0)
             run.log(f"Picking up where it stopped: {len(left)} websites still to read")
         else:
-            run.step("find", "running", f"Searching “{_query(f)}”")
-            if smart:
+            skip = list(settings.get("skip_sites") or []) + list(ALWAYS_SKIP)
+            if f.get("source") == "directory":
+                places, counts = _from_directory(f, limit, uid, skip, run)
+            elif smart:
+                run.step("find", "running", f"Searching “{_query(f)}”")
                 run.log(f"Searching Google Maps for “{_query(f)}”")
-                maps = gmaps.search(_query(f), limit)
+                maps = gmaps.search(_queries(f, limit), limit)  # a big run asks Maps a few similar searches
                 places = [{**p, "sources": [{"label": "Google Maps", "url": p["maps_url"]}], "people": [], "founded_year": None}
                           for p in maps]
                 counts = {"Google Maps": len(maps)}
             else:
+                run.step("find", "running", f"Searching “{_query(f)}”")
                 more = len(_queries(f, limit)) - 1
                 run.log(f"Searching Google Maps, BBB and OpenStreetMap for “{_query(f)}”"
                         + (f" and {more} similar search{'es' if more > 1 else ''}" if more else ""))
                 places, counts = _find(f, limit, run)
             if run.stopped():
                 return
-            skip = list(settings.get("skip_sites") or []) + list(ALWAYS_SKIP)
             known, picked, by_domain = store.known_domains(uid), [], {}
             for p in places:
                 d = website.clean_domain(p["website"])
@@ -477,15 +524,29 @@ def _search(row: dict) -> None:
             run.step("save", "running")
             rows = []
             for p in picked:
-                r = store.company_row(uid, {"name": p["name"], "website": p["domain"], "country": f["country"], "state": f.get("state"),
-                                            "city": f["city"], "company_type": f["company_type"]}, "search")
+                # A directory says where each company is; a city search puts them all in the searched place
+                r = store.company_row(uid, {"name": p["name"], "website": p["domain"], "country": f["country"],
+                                            "state": p.get("state") or f.get("state"), "city": p.get("city") or f.get("city") or "",
+                                            "company_type": f["company_type"]}, "search")
                 # With enrichment the company waits in the normal queue ("queued") and the lead finder loop runs its 8 steps
                 r.update(status="queued" if smart else "enriching", phone=p["phone"], address=p["address"], agent_run_id=run.id,
                          rating=round(p["rating"], 1) if p["rating"] else None, reviews=p["reviews"],
                          sources=[x for x in p["sources"] if x.get("url")])
                 rows.append(r)
-            saved = [x for i in range(0, len(rows), 200) for x in _db().table(store.COMPANIES).insert(rows[i:i + 200]).execute().data]
+            with _save_lock:
+                # Another run may have saved some of these while this one was searching
+                known = store.known_domains(uid)
+                taken = [r for r in rows if r["domain"] in known]
+                rows = [r for r in rows if r["domain"] not in known]
+                saved = [x for i in range(0, len(rows), 200) for x in _db().table(store.COMPANIES).insert(rows[i:i + 200]).execute().data]
+            if taken:
+                run.log(f"{len(taken)} compan{'y was' if len(taken) == 1 else 'ies were'} just saved by another agent run, so skipped")
             run.step("save", "done", f"{len(saved)} companies saved")
+            if not saved:
+                for s in run.steps[2:]:
+                    run.step(s["id"], "done", "Nothing new to do")
+                _save(run.id, {"status": "done", "finished_at": _now().isoformat()})
+                return
 
             if smart:
                 run.log(f"{len(saved)} companies handed to enrichment: Hunter finds the owners, Reoon checks emails, the AI writes lines")
@@ -530,7 +591,7 @@ def _search(row: dict) -> None:
         run.step("emails", "done", f"{with_email} of {total} companies have an email")
         run.step("send", "running", "Starting")
         _save(run.id, {"status": "sending", "next_send_at": _now().isoformat()})
-    except gmaps.MapsError as e:
+    except (gmaps.MapsError, listings.ListingError) as e:
         run.step("find", "failed", str(e))
         _save(run.id, {"status": "failed", "error": str(e), "finished_at": _now().isoformat()})
     except Exception as e:  # anything unexpected: the run fails with a plain message, the server carries on
@@ -540,7 +601,11 @@ def _search(row: dict) -> None:
 
 # ---------- Step 5: send, one email per tick ----------
 
-def render(settings: dict, company: dict, contact: dict) -> tuple[str, str]:
+def render(settings: dict, company: dict, contact: dict, f: dict | None = None) -> tuple[str, str]:
+    """The message written for this run (`f`, the run's filters) when it has one, else the agent message from Settings"""
+    f = f or {}
+    subject = (f.get("subject") or "").strip() or settings.get("agent_subject") or ""
+    message = (f.get("message") or "").strip() or settings.get("agent_message") or ""
     first = contact["name"].split()[0] if contact.get("title") != "Company email" else ""
     greeting = f"Hi {first}," if first else f"Hi {company['name']} team,"
 
@@ -550,7 +615,7 @@ def render(settings: dict, company: dict, contact: dict) -> tuple[str, str]:
             text = re.sub(r"\{\{\s*" + key + r"\s*\}\}", lambda _, v=value: v, text)
         return text
 
-    return fill(settings.get("agent_subject") or ""), fill(settings.get("agent_message") or "").strip()
+    return fill(subject), fill(message).strip()
 
 
 def render_bulk(f: dict, company: dict, contact: dict) -> tuple[str, str]:
@@ -606,7 +671,8 @@ def _finish(run: dict, status: str, note: str, error: str | None = None) -> None
     _save(run["id"], {"status": status, "steps": steps, "error": error, "finished_at": _now().isoformat()})
 
 
-def _send_one(run: dict) -> None:
+def _send_one(run: dict) -> int | None:
+    """Seconds until the mailbox may send again when an email went out (or was tried), else None"""
     uid, rid = run["user_id"], run["id"]
     mb = mailbox.load(uid)
     if not mb:
@@ -650,11 +716,11 @@ def _send_one(run: dict) -> None:
         return _save(rid, {"processed": processed, "counts": counts})
 
     # With enrichment it is "Your email" with the person's personal line; bulk, the message written for this run;
-    # without enrichment, the agent message
+    # without enrichment, the message written for this run or else the agent message
     mode = run.get("mode")
     subject, body = (mailbox.render(settings, company, contact) if mode == "smart"
                      else render_bulk(run["filters"], company, contact) if mode == "bulk"
-                     else render(settings, company, contact))
+                     else render(settings, company, contact, run.get("filters")))
     if test:
         note = f"TEST MODE: with test mode off, this email goes to {contact['name']} <{contact['email']}>.\n\n"
         msg = mailbox.build(mb, mailbox.test_address(mb), mb.get("from_name") or "", f"[Test] {subject}", note + body)
@@ -688,9 +754,11 @@ def _send_one(run: dict) -> None:
         started = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
         if _bounces_since(mb, started) >= BOUNCE_LIMIT:
             _save(rid, patch)
-            return _finish({**run, "steps": steps}, "stopped", "Stopped: several emails bounced",
-                           f"{BOUNCE_LIMIT} or more emails bounced, so the run stopped to protect your mailbox. Check your inbox.")
+            _finish({**run, "steps": steps}, "stopped", "Stopped: several emails bounced",
+                    f"{BOUNCE_LIMIT} or more emails bounced, so the run stopped to protect your mailbox. Check your inbox.")
+            return gap
     _save(rid, patch)
+    return gap
 
 
 # ---------- The loop's tick ----------
@@ -701,14 +769,15 @@ def recover() -> None:
     enrichment is marked ready as it is, so it never falls into the enrichment queue and spends credits. (With
     enrichment, the lead finder loop recovers its own companies.)"""
     resuming = set()
-    for r in _db().table(RUNS).select("id,mode").eq("status", "running").execute().data:
+    for r in _db().table(RUNS).select("id,mode,filters").eq("status", "running").execute().data:
         left = (_db().table(store.COMPANIES).select("id").eq("agent_run_id", r["id"]).eq("status", "enriching").limit(1)
                 .execute().data) if r.get("mode") == "fast" else []
         if left:  # cut off while reading websites: it carries on with the rest, keeping what it already did
             resuming.add(r["id"])
             _save(r["id"], {"status": "queued"})
         else:
-            _save(r["id"], {"status": "queued", "steps": new_steps(r.get("mode") or "fast"), "counts": {}})
+            _save(r["id"], {"status": "queued", "steps": new_steps(r.get("mode") or "fast", (r.get("filters") or {}).get("source")),
+                            "counts": {}})
     fast = [r["id"] for r in _db().table(RUNS).select("id").eq("mode", "fast").order("created_at", desc=True).limit(50).execute().data
             if r["id"] not in resuming]
     if fast:
@@ -750,28 +819,40 @@ def _follow_enrichment(run: dict) -> None:
     _save(run["id"], patch)
 
 
+def _start_queued() -> None:
+    """Fill every free scan slot with the oldest queued runs"""
+    _threads[:] = [t for t in _threads if t.is_alive()]
+    free = max(1, config.MAX_PARALLEL_SCANS) - len(_threads)
+    if free <= 0:
+        return
+    for row in _db().table(RUNS).select("*").eq("status", "queued").order("created_at").limit(free).execute().data:
+        claimed = (_db().table(RUNS).update({"status": "running", "updated_at": _now().isoformat()})
+                   .eq("id", row["id"]).eq("status", "queued").execute().data)
+        if claimed:
+            t = threading.Thread(target=_search, args=(claimed[0],), name=f"agent-search-{row['id'][:8]}", daemon=True)
+            t.start()
+            _threads.append(t)
+
+
 def tick() -> None:
-    global _thread
     for run in _db().table(RUNS).select("*").eq("status", "enriching").execute().data:
         try:
             _follow_enrichment(run)
         except Exception as e:
             log.warning("agent run %s couldn't follow enrichment: %s: %s", run["id"], type(e).__name__, e)
-    if _thread is None or not _thread.is_alive():
-        queued = _db().table(RUNS).select("*").eq("status", "queued").order("created_at").limit(1).execute().data
-        if queued:
-            row = queued[0]
-            claimed = _db().table(RUNS).update({"status": "running", "updated_at": _now().isoformat()}).eq("id", row["id"]).eq("status", "queued").execute().data
-            if claimed:
-                _thread = threading.Thread(target=_search, args=(claimed[0],), name="agent-search", daemon=True)
-                _thread.start()
+    _start_queued()
     due = (_db().table(RUNS).select("*").in_("status", ["sending", "waiting"]).lte("next_send_at", _now().isoformat())
-           .order("next_send_at").limit(3).execute().data)
+           .order("next_send_at").limit(50).execute().data)
     for run in due:
+        uid = run["user_id"]
+        if _now() < _next_send.get(uid, datetime.min.replace(tzinfo=timezone.utc)):
+            continue  # another of this user's runs just sent: each mailbox keeps one email per gap
         try:
             if run["status"] == "waiting":
                 _save(run["id"], {"status": "sending"})
-            _send_one(run)
+            gap = _send_one(run)
+            if gap:
+                _next_send[uid] = _now() + timedelta(seconds=gap)
         except Exception as e:
             log.warning("agent run %s couldn't send: %s: %s", run["id"], type(e).__name__, e)
             _save(run["id"], {"next_send_at": (_now() + timedelta(minutes=2)).isoformat()})

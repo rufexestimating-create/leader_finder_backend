@@ -3,8 +3,10 @@ polls GET /lead-finder/companies to watch the steps finish."""
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from app.api.deps import get_current_user
-from app.schemas.lead_finder import AgentRunIn, ContactPatch, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SendSmtpIn, SettingsIn
-from app.services.lead_finder import agent, keys, mailbox, runner, store
+from app.core.config import settings
+from app.schemas.lead_finder import (AgentRunIn, ContactPatch, DirectoryCheckIn, KeyIn, MailboxIn, MailboxModeIn, RetryIn, SendSmtpIn,
+                                     SettingsIn)
+from app.services.lead_finder import agent, keys, listings, mailbox, runner, store
 
 router = APIRouter(dependencies=[Depends(get_current_user)])
 
@@ -171,15 +173,32 @@ def start_agent_run(data: AgentRunIn, user: dict = Depends(get_current_user)):
         hunter = runner.tools_status(s, keys.load(user["id"]))["hunter"]
         if not (hunter["connected"] and hunter["on"]):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "With enrichment needs your Hunter key: add it in Settings, under Connect your tools.")
-    active = [r for r in agent.list_runs(user["id"], 5) if r["status"] in ("queued", "running")]
-    if active:
-        raise HTTPException(status.HTTP_409_CONFLICT, "A run is already finding companies. Wait for it to finish or stop it.")
+    if agent.active_count(user["id"]) >= settings.MAX_ACTIVE_AGENTS:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"{settings.MAX_ACTIVE_AGENTS} agents are already working. Wait for one to finish or stop one.")
+    if data.source == "directory":
+        try:
+            data.directory_url = listings.check_url(data.directory_url)
+        except listings.ListingError as e:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     return agent.start(user["id"], data.model_dump())
 
 
-@router.get("/agent/runs", summary="The latest agent runs, newest first")
-def list_agent_runs(user: dict = Depends(get_current_user)):
-    return agent.list_runs(user["id"])
+@router.post("/agent/directory/check", summary="Open page 1 of a directory link: how many companies it lists")
+def check_directory(data: DirectoryCheckIn):
+    try:
+        return listings.preview(data.url)
+    except listings.ListingError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+
+
+@router.get("/agent/runs", summary="The latest agent runs, newest first; a queued one says its place in the queue")
+def list_agent_runs(limit: int = 20, user: dict = Depends(get_current_user)):
+    runs = agent.list_runs(user["id"], max(1, min(limit, 50)))
+    for r in runs:
+        if r["status"] == "queued":
+            r["queue_position"] = agent.queue_position(r["id"])
+    return runs
 
 
 @router.get("/agent/runs/{run_id}", summary="One agent run with its companies and progress")
@@ -187,6 +206,8 @@ def get_agent_run(run_id: str, user: dict = Depends(get_current_user)):
     run = agent.get(user["id"], run_id)
     if not run:
         raise _not_found("Run")
+    if run["status"] == "queued":
+        run["queue_position"] = agent.queue_position(run_id)
     return run
 
 
