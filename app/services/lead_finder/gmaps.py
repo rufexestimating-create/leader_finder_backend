@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from app.core.config import settings
@@ -27,6 +28,22 @@ _EMAIL = re.compile(r"[a-z0-9][a-z0-9._%+-]{0,63}@[a-z0-9-]+(?:\.[a-z0-9-]+)*\.[
 
 class MapsError(Exception):
     pass
+
+
+STALL_SECONDS = 180  # no new place for this long: the search is over even if the scraper hasn't exited
+
+
+def _stop(name: str, proc: subprocess.Popen) -> None:
+    """Stop the scraper's container (killing only the docker CLI would leave it running) and reap the CLI"""
+    try:
+        subprocess.run(["docker", "kill", name], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
 
 
 def _depth(wanted: int) -> int:
@@ -53,23 +70,39 @@ def search(query: str | list[str], limit: int, timeout: int | None = None, email
         raise MapsError("Searching Google Maps needs Docker on the server, and it isn't installed.")
     with _lock, tempfile.TemporaryDirectory(prefix="gmaps-") as tmp:
         Path(tmp, "queries.txt").write_text("".join(q.strip() + "\n" for q in queries), encoding="utf-8")
-        cmd = ["docker", "run", "--rm", "--memory=1200m", "--cpus=0.9", "-e", "DISABLE_TELEMETRY=1",
+        name = f"gmaps-{uuid.uuid4().hex[:12]}"  # named, so the container itself can be stopped, not only the CLI
+        cmd = ["docker", "run", "--rm", "--name", name, "--memory=1200m", "--cpus=0.9", "-e", "DISABLE_TELEMETRY=1",
                "-v", "gmaps-playwright-cache:/opt", "-v", f"{tmp}:/data", IMAGE,
                "-input", "/data/queries.txt", "-results", "/data/results.csv", "-depth", str(_depth(per_query)),
                "-c", "1", "-exit-on-inactivity", "2m", "-lang", "en"] + (["-email"] if emails else [])
         out = Path(tmp, "results.csv")
+        enough = per_query * len(queries)
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
-        started, told = time.monotonic(), -1
-        while proc.poll() is None:  # results.csv grows as places are read: say how far it got
-            if time.monotonic() - started > timeout:
-                proc.kill()
-                raise MapsError("Google Maps took too long to answer. Try again in a few minutes.")
-            n = _rows(out)
-            if n != told:
-                progress(n)
-                told = n
-            time.sleep(10)
+        started = grew = time.monotonic()
+        told, why = -1, ""
+        try:
+            while proc.poll() is None:  # results.csv grows as places are read: say how far it got
+                n = _rows(out)
+                if n != told:
+                    progress(n)
+                    told, grew = n, time.monotonic()
+                # The scraper sometimes keeps its browser open after the last place: don't wait on it for nothing
+                if n >= enough:
+                    why = "enough"
+                elif n and time.monotonic() - grew > STALL_SECONDS:
+                    why = "stalled"
+                elif time.monotonic() - started > timeout:
+                    why = "timeout"
+                if why:
+                    log.info("gmaps: stopping the scraper (%s) with %s places", why, n)
+                    break
+                time.sleep(10)
+        finally:
+            if proc.poll() is None:
+                _stop(name, proc)
         err = proc.stderr.read() if proc.stderr else ""
+        if why == "timeout" and not _rows(out):
+            raise MapsError("Google Maps took too long to answer. Try again in a few minutes.")
         if not out.exists():
             log.warning("gmaps scraper exited %s: %s", proc.returncode, err[-400:])
             raise MapsError("Google Maps couldn't be searched right now. Try again in a few minutes.")
