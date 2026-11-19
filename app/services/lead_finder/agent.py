@@ -120,15 +120,88 @@ def get(user_id: str, run_id: str) -> dict | None:
     return {**rows[0], "companies": [store._with_contacts(c) for c in companies]}
 
 
+STOPPED_NOTE = "The agent run was stopped before this company was looked into."
+
+
 def stop(user_id: str, run_id: str) -> dict | None:
     rows = (_db().table(RUNS).update({"status": "stopped", "finished_at": _now().isoformat(), "updated_at": _now().isoformat()})
             .eq("user_id", user_id).eq("id", run_id).in_("status", ACTIVE).execute().data)
     if rows and rows[0].get("mode") == "smart":
         # Companies still waiting for enrichment don't spend credits after a stop
-        (_db().table(store.COMPANIES).update({"status": "failed", "error": "The agent run was stopped before this company was looked into.",
+        (_db().table(store.COMPANIES).update({"status": "failed", "error": STOPPED_NOTE,
                                               "finished_at": _now().isoformat()})
          .eq("agent_run_id", run_id).eq("status", "queued").execute())
     return rows[0] if rows else None
+
+
+class ResumeError(Exception):
+    """Why a run can't carry on; the message is shown to the user"""
+
+
+def resume(user_id: str, run_id: str) -> dict:
+    """Carry on a failed or stopped run from where it ended: sending if its emails were found, enrichment if its
+    companies were saved, reading the websites it hadn't read, else a fresh search (companies already saved are skipped,
+    emails already sent are never sent again)."""
+    rows = _db().table(RUNS).select("*").eq("user_id", user_id).eq("id", run_id).limit(1).execute().data
+    if not rows:
+        raise ResumeError("This run doesn't exist.")
+    r = rows[0]
+    if r["status"] not in ("failed", "stopped"):
+        raise ResumeError("This run is still working or already finished.")
+    if any(t.is_alive() and t.name == f"agent-search-{run_id}" for t in _threads):
+        raise ResumeError("This run is still stopping. Try again in a few seconds.")
+    mode = r.get("mode") or "fast"
+    steps = [dict(s) for s in (r.get("steps") or new_steps(mode))]
+    state = {s["id"]: s["state"] for s in steps}
+    counts = dict(r.get("counts") or {})
+    patch: dict = {"error": None, "finished_at": None}
+
+    def mark(step_id: str, note: str) -> None:
+        for s in steps:
+            if s["id"] == step_id:
+                s["state"], s["note"] = "running", note
+
+    def unfail() -> None:
+        for s in steps:
+            if s["state"] == "failed":
+                s["state"], s["note"] = "pending", ""
+
+    left = (_db().table(store.COMPANIES).select("id").eq("agent_run_id", run_id).eq("status", "enriching").limit(1)
+            .execute().data) if mode == "fast" else []
+    if state.get("send") in ("running", "done", "failed") or (mode == "bulk" and state.get("send") == "pending" and counts.get("emails")):
+        unfail()
+        mark("send", "Carrying on")
+        patch.update(status="sending", next_send_at=_now().isoformat())
+    elif mode == "bulk":
+        raise ResumeError("This list was stopped before its emails were checked. Start a new bulk send with it.")
+    elif mode == "smart" and state.get("save") == "done":
+        # Companies the stop kept out of enrichment go back into the queue
+        (_db().table(store.COMPANIES).update({"status": "queued", "error": None, "finished_at": None})
+         .eq("agent_run_id", run_id).eq("status", "failed").eq("error", STOPPED_NOTE).execute())
+        unfail()
+        mark("enrich", "Carrying on")
+        patch.update(status="enriching")
+    elif left:
+        unfail()  # the search carries on with the websites it hadn't read
+        patch.update(status="queued")
+    elif mode == "fast" and state.get("read") == "done":
+        unfail()
+        mark("send", "Carrying on")
+        patch.update(status="sending", next_send_at=_now().isoformat())
+    else:
+        # It ended while finding companies: search again; the ones it already saved are skipped
+        patch.update(status="queued", steps=new_steps(mode, (r.get("filters") or {}).get("source")), counts={})
+    if "steps" not in patch:
+        patch["steps"] = steps
+    if "counts" not in patch:
+        counts.pop("current", None)
+        patch["counts"] = counts
+    _add_log(patch["counts"], "Carrying on from where it stopped")
+    updated = (_db().table(RUNS).update({**patch, "updated_at": _now().isoformat()}).eq("id", run_id)
+               .in_("status", ["failed", "stopped"]).execute().data)
+    if not updated:
+        raise ResumeError("This run changed in the meantime. Refresh and try again.")
+    return updated[0]
 
 
 def _save(run_id: str, patch: dict) -> None:
@@ -829,7 +902,7 @@ def _start_queued() -> None:
         claimed = (_db().table(RUNS).update({"status": "running", "updated_at": _now().isoformat()})
                    .eq("id", row["id"]).eq("status", "queued").execute().data)
         if claimed:
-            t = threading.Thread(target=_search, args=(claimed[0],), name=f"agent-search-{row['id'][:8]}", daemon=True)
+            t = threading.Thread(target=_search, args=(claimed[0],), name=f"agent-search-{row['id']}", daemon=True)
             t.start()
             _threads.append(t)
 

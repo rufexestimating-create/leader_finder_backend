@@ -218,6 +218,18 @@ def stop_agent_run(run_id: str, user: dict = Depends(get_current_user)):
     return agent.get(user["id"], run_id)
 
 
+@router.post("/agent/runs/{run_id}/resume", summary="Carry on a failed or stopped agent run from where it ended")
+def resume_agent_run(run_id: str, user: dict = Depends(get_current_user)):
+    if agent.active_count(user["id"]) >= settings.MAX_ACTIVE_AGENTS:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"{settings.MAX_ACTIVE_AGENTS} agents are already working. Wait for one to finish or stop one.")
+    try:
+        agent.resume(user["id"], run_id)
+    except agent.ResumeError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(e))
+    return agent.get(user["id"], run_id)
+
+
 # ---------- The user's own mailbox ----------
 
 def _mailbox(user: dict) -> dict:
